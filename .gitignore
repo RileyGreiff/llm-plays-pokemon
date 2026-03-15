@@ -1,0 +1,11 @@
+venv/
+.env
+logs/
+__pycache__/
+*.pyc
+BizHawk/
+bridge/
+.claude/
+*.gba
+*.gb
+8}

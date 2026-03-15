@@ -1,0 +1,3 @@
+@echo off
+echo Starting BizHawk...
+start "" "%~dp0BizHawk\EmuHawk.exe"

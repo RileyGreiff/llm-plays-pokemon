@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LLM Plays Pokemon — Overlay</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', 'Consolas', monospace;
+    background: transparent;
+    color: #fff;
+    overflow: hidden;
+  }
+
+  .overlay {
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    width: 420px;
+    background: rgba(0, 0, 0, 0.82);
+    border: 2px solid #e63946;
+    border-radius: 12px;
+    padding: 16px 20px;
+    backdrop-filter: blur(6px);
+  }
+
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+  }
+
+  .title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #e63946;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+
+  .model-badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .model-haiku { background: #2a9d8f; color: #fff; }
+  .model-sonnet { background: #e76f51; color: #fff; }
+
+  .action-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+  }
+
+  .button-display {
+    font-size: 22px;
+    font-weight: 800;
+    background: #e63946;
+    color: #fff;
+    padding: 4px 14px;
+    border-radius: 6px;
+    min-width: 60px;
+    text-align: center;
+  }
+
+  .reason {
+    font-size: 13px;
+    color: #ddd;
+    line-height: 1.4;
+    flex: 1;
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 16px;
+    font-size: 12px;
+    color: #aaa;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .stats .label { color: #888; }
+  .stats .value { color: #fff; font-weight: 600; text-align: right; }
+
+  .gamestate {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .gamestate-title {
+    font-size: 10px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+
+  .gamestate-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 16px;
+    font-size: 12px;
+  }
+
+  .gamestate-grid .label { color: #888; }
+  .gamestate-grid .value { color: #fff; font-weight: 600; text-align: right; }
+
+  .progress-bar {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .progress-text {
+    font-size: 11px;
+    color: #aaa;
+    line-height: 1.4;
+  }
+
+  .objectives {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+  }
+
+  .objectives-title {
+    font-size: 10px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+
+  .objective-tier {
+    margin-bottom: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+  }
+
+  .objective-tier:last-child {
+    margin-bottom: 0;
+  }
+
+  .tier-label {
+    font-weight: 700;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-right: 4px;
+  }
+
+  .tier-label.goal { color: #e63946; }
+  .tier-label.strategy { color: #e9c46a; }
+  .tier-label.task { color: #2a9d8f; }
+
+  .tier-text {
+    color: #ccc;
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+  }
+
+  .status-connected { background: #2a9d8f; box-shadow: 0 0 6px #2a9d8f; }
+  .status-disconnected { background: #e63946; box-shadow: 0 0 6px #e63946; }
+
+  .battle-indicator {
+    display: none;
+    font-size: 11px;
+    color: #e76f51;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .battle-indicator.active { display: inline; }
+
+  .timeline {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    max-height: 120px;
+    overflow-y: auto;
+  }
+
+  .timeline-title {
+    font-size: 10px;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+
+  .timeline-entry {
+    font-size: 11px;
+    color: #ccc;
+    line-height: 1.4;
+    margin-bottom: 6px;
+    padding-left: 8px;
+    border-left: 2px solid #e63946;
+  }
+
+  .timeline-time {
+    color: #e63946;
+    font-weight: 700;
+    font-size: 10px;
+  }
+
+  .timeline-text {
+    color: #aaa;
+  }
+</style>
+</head>
+<body>
+<div class="overlay">
+  <div class="header">
+    <div>
+      <span class="status-dot status-disconnected" id="statusDot"></span>
+      <span class="title">LLM Plays Pokemon</span>
+    </div>
+    <div>
+      <span class="battle-indicator" id="battleIndicator">BATTLE</span>
+      <span class="model-badge model-haiku" id="modelBadge">Haiku</span>
+    </div>
+  </div>
+
+  <div class="action-row">
+    <div class="button-display" id="actionButton">—</div>
+    <div class="reason" id="actionReason">Waiting for connection...</div>
+  </div>
+
+  <div class="stats">
+    <span class="label">Actions</span>
+    <span class="value" id="actionCount">0</span>
+    <span class="label">Cost</span>
+    <span class="value" id="totalCost">$0.0000</span>
+    <span class="label">Badges</span>
+    <span class="value" id="badges">0</span>
+    <span class="label">Maps</span>
+    <span class="value" id="mapsVisited">0</span>
+  </div>
+
+  <div class="gamestate">
+    <div class="gamestate-title">Game State</div>
+    <div class="gamestate-grid">
+      <span class="label">Position</span>
+      <span class="value" id="gsPosition">--</span>
+      <span class="label">Map</span>
+      <span class="value" id="gsMap">--</span>
+      <span class="label">HP</span>
+      <span class="value" id="gsHp">--</span>
+    </div>
+    <div id="gsPartyList" style="margin-top:6px; font-size:11px; color:#aaa;"></div>
+  </div>
+
+  <div class="objectives">
+    <div class="objectives-title">Objectives</div>
+    <div class="objective-tier">
+      <span class="tier-label goal">Goal</span>
+      <span class="tier-text" id="tier1Text">—</span>
+    </div>
+    <div class="objective-tier">
+      <span class="tier-label strategy">Strategy</span>
+      <span class="tier-text" id="tier2Text">—</span>
+    </div>
+    <div class="objective-tier">
+      <span class="tier-label task">Task</span>
+      <span class="tier-text" id="tier3Text">—</span>
+    </div>
+  </div>
+
+  <div class="timeline" id="timelineSection" style="display:none;">
+    <div class="timeline-title">Hourly Recap</div>
+    <div id="timelineEntries"></div>
+  </div>
+
+</div>
+
+<script>
+const WS_URL = "ws://localhost:8765";
+let ws = null;
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    document.getElementById("statusDot").className = "status-dot status-connected";
+    document.getElementById("actionReason").textContent = "Connected. Waiting for first action...";
+  };
+
+  ws.onclose = () => {
+    document.getElementById("statusDot").className = "status-dot status-disconnected";
+    document.getElementById("actionReason").textContent = "Disconnected. Reconnecting...";
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+
+    // Action
+    document.getElementById("actionButton").textContent = data.action || "—";
+    document.getElementById("actionReason").textContent = data.reason || "";
+
+    // Model badge
+    const badge = document.getElementById("modelBadge");
+    if (data.model && data.model.includes("sonnet")) {
+      badge.textContent = "Sonnet";
+      badge.className = "model-badge model-sonnet";
+    } else {
+      badge.textContent = "Haiku";
+      badge.className = "model-badge model-haiku";
+    }
+
+    // Battle indicator
+    const battle = document.getElementById("battleIndicator");
+    battle.className = data.in_battle ? "battle-indicator active" : "battle-indicator";
+
+    // Stats
+    document.getElementById("actionCount").textContent = data.action_count || 0;
+    document.getElementById("totalCost").textContent = `$${(data.total_cost || 0).toFixed(4)}`;
+    document.getElementById("badges").textContent = data.badges || 0;
+    document.getElementById("mapsVisited").textContent = data.maps_visited || 0;
+
+    // Game state
+    document.getElementById("gsPosition").textContent = `(${data.player_x ?? '--'}, ${data.player_y ?? '--'})`;
+    document.getElementById("gsMap").textContent = (data.map_name || '--').replace(/_/g, ' ');
+    document.getElementById("gsHp").textContent = data.player_hp ?? '--';
+
+    // Party list
+    const partyEl = document.getElementById("gsPartyList");
+    if (data.party && data.party.length > 0) {
+      partyEl.innerHTML = data.party.map(p => {
+        const pct = p.max_hp > 0 ? Math.round(p.hp / p.max_hp * 100) : 0;
+        const color = pct > 50 ? '#2a9d8f' : pct > 20 ? '#e9c46a' : '#e63946';
+        return `<span style="color:${color}">${p.name} Lv${p.level} ${p.hp}/${p.max_hp}</span>`;
+      }).join(' &middot; ');
+    } else {
+      partyEl.textContent = 'No Pokemon';
+    }
+
+    // Objectives (3 tiers)
+    if (data.tier1_objective) {
+      document.getElementById("tier1Text").textContent = data.tier1_objective;
+    }
+    if (data.tier2_objective) {
+      document.getElementById("tier2Text").textContent = data.tier2_objective;
+    }
+    if (data.objective) {
+      document.getElementById("tier3Text").textContent = data.objective;
+    }
+
+    // Hourly timeline
+    if (data.hourly_summaries && data.hourly_summaries.length > 0) {
+      document.getElementById("timelineSection").style.display = "block";
+      const container = document.getElementById("timelineEntries");
+      container.innerHTML = data.hourly_summaries.slice(-3).map(s =>
+        `<div class="timeline-entry">
+          <span class="timeline-time">${s.time}</span>
+          <span class="timeline-text"> ${s.text}</span>
+        </div>`
+      ).join("");
+    }
+
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
