@@ -413,6 +413,10 @@ def read_game_state() -> dict:
     state["has_hm05_flash"] = _value_or_default(hm_flags_idx + 4) > 0
     state["has_hm06_rock_smash"] = _value_or_default(hm_flags_idx + 5) > 0
     state["has_hm07_waterfall"] = _value_or_default(hm_flags_idx + 6) > 0
+    state["has_national_dex"] = _value_or_default(hm_flags_idx + 7) > 0
+    if state["has_pokedex"]:
+        # Once the player has the Pokedex, the Oak's Parcel step is necessarily complete.
+        state["has_oaks_parcel"] = True
     state["owned_hms"] = [
         name for name, owned in [
             ("Cut", state["has_hm01_cut"]),
@@ -443,8 +447,8 @@ def read_game_state() -> dict:
         ] if owned
     ]
 
-    extended_payload_present = len(values) >= hm_flags_idx + 7
-    enemy_idx = hm_flags_idx + 7 if extended_payload_present else PARTY_START + 6 * PARTY_SLOT_SIZE
+    extended_payload_present = len(values) >= hm_flags_idx + 8
+    enemy_idx = hm_flags_idx + 8 if extended_payload_present else PARTY_START + 6 * PARTY_SLOT_SIZE
     state["enemy_species"] = _value_or_default(enemy_idx)
     state["enemy_hp"] = _value_or_default(enemy_idx + 2)
     state["enemy_level"] = _value_or_default(enemy_idx + 1)

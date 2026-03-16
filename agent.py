@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import random
 import threading
 import time
 import sqlite3
@@ -244,75 +245,34 @@ def print_hourly_report(conn: sqlite3.Connection) -> None:
 class NamingContext:
     """Tracks an in-progress nickname entry flow."""
 
-    awaiting_screen: bool = False
-    prompt_cb2: int | None = None
-    known_cb2: int | None = None
     prompt_step: int = 0
-    handled: bool = False
+    naming_step: int = 0
     last_party_count: int = 0
 
 
 def _is_probable_naming_screen(game_state: dict, naming: NamingContext) -> bool:
-    """Heuristic naming-screen detector used only as a fallback cancel path."""
-    if game_state.get("in_battle", False):
-        return False
-    if game_state.get("party_count", 0) <= 0:
-        return False
-
-    cb2_raw = game_state.get("cb2_raw", 0)
-    if naming.known_cb2 and cb2_raw == naming.known_cb2:
-        return True
-
-    return (
-        naming.awaiting_screen
-        and game_state.get("game_state") == "unknown"
-        and not game_state.get("in_dialogue", False)
-    )
+    """Return True when the explicit naming-screen state is active."""
+    return game_state.get("game_state") == "naming"
 
 
 def _is_nickname_prompt(game_state: dict, naming: NamingContext) -> bool:
-    """Return True for the yes/no prompt that appears before the naming keyboard."""
-    if game_state.get("in_battle", False) or naming.handled:
-        return False
-    text = (game_state.get("dialogue_text") or "").lower()
-    return "give a nickname" in text
+    """Return True when the explicit nickname yes/no prompt is active."""
+    return game_state.get("game_state") == "nickname_prompt"
 
 
 def _maybe_begin_naming(game_state: dict, naming: NamingContext):
-    """Arm or activate the naming flow based on live state transitions."""
+    """Reset prompt sequencing when the player first receives a Pokemon."""
     current_party_count = game_state.get("party_count", 0)
     if naming.last_party_count == 0 and current_party_count > 0:
-        naming.awaiting_screen = True
-        naming.handled = False
         naming.prompt_step = 0
-        naming.prompt_cb2 = None
-        naming.known_cb2 = None
+        naming.naming_step = 0
     naming.last_party_count = current_party_count
-
-    if _is_nickname_prompt(game_state, naming):
-        naming.awaiting_screen = True
-        cb2_raw = game_state.get("cb2_raw", 0)
-        if cb2_raw and naming.prompt_cb2 is None:
-            naming.prompt_cb2 = cb2_raw
-        return
-
-    cb2_raw = game_state.get("cb2_raw", 0)
-    if naming.awaiting_screen and game_state.get("game_state") == "unknown" and cb2_raw and cb2_raw != naming.prompt_cb2:
-        naming.known_cb2 = cb2_raw
-
-    if not _is_probable_naming_screen(game_state, naming):
-        if naming.awaiting_screen and current_party_count <= 0:
-            naming.awaiting_screen = False
-            naming.prompt_cb2 = None
-            naming.known_cb2 = None
-            naming.prompt_step = 0
-            naming.handled = False
-        return
 
 
 def _get_naming_action(game_state: dict, naming: NamingContext) -> dict | None:
     """Return the next deterministic nickname-prompt action, if any."""
     if _is_nickname_prompt(game_state, naming):
+        naming.naming_step = 0
         if naming.prompt_step == 0:
             naming.prompt_step = 1
             return {
@@ -320,10 +280,6 @@ def _get_naming_action(game_state: dict, naming: NamingContext) -> dict | None:
                 "reason": "Structured naming: move to 'No' on the nickname prompt",
                 "display": "Selecting No on the nickname prompt.",
             }
-        naming.awaiting_screen = False
-        naming.handled = True
-        naming.prompt_cb2 = None
-        naming.known_cb2 = None
         naming.prompt_step = 0
         return {
             "action": "A",
@@ -331,16 +287,73 @@ def _get_naming_action(game_state: dict, naming: NamingContext) -> dict | None:
             "display": "Declining the nickname prompt.",
         }
     if not _is_probable_naming_screen(game_state, naming):
+        naming.naming_step = 0
         return None
-    naming.awaiting_screen = False
-    naming.handled = True
-    naming.prompt_cb2 = None
-    naming.known_cb2 = None
     naming.prompt_step = 0
+    if naming.naming_step == 0:
+        naming.naming_step = 1
+        return {
+            "action": "Start",
+            "reason": "Structured naming: open the OK confirmation on the naming screen",
+            "display": "Opening the naming OK option.",
+        }
+    naming.naming_step = 0
     return {
-        "action": "B",
-        "reason": "Structured naming: cancel the naming screen fallback",
-        "display": "Backing out of the naming screen.",
+        "action": "A",
+        "reason": "Structured naming: confirm OK on the naming screen",
+        "display": "Confirming the naming screen selection.",
+    }
+
+
+def _battle_action_button_toward(cursor: int, target: int) -> str:
+    """Return the next directional/A press for the 2x2 battle action menu."""
+    if cursor == target:
+        return "A"
+    positions = {
+        0: (0, 0),  # Fight
+        1: (1, 0),  # Bag
+        2: (0, 1),  # Pokemon
+        3: (1, 1),  # Run
+    }
+    cur_x, cur_y = positions.get(cursor, (0, 0))
+    tgt_x, tgt_y = positions.get(target, (0, 0))
+    if cur_x < tgt_x:
+        return "Right"
+    if cur_x > tgt_x:
+        return "Left"
+    if cur_y < tgt_y:
+        return "Down"
+    if cur_y > tgt_y:
+        return "Up"
+    return "A"
+
+
+def _get_battle_menu_action(game_state: dict, llm_action: dict | None = None) -> dict | None:
+    """Deterministically drive the 2x2 battle action menu when intent is obvious."""
+    if not game_state.get("in_battle", False):
+        return None
+    if game_state.get("battle_menu_state", 0) != 1:
+        return None
+
+    reason_text = ""
+    if llm_action:
+        reason_text = " ".join(
+            str(llm_action.get(key, "")) for key in ("action", "reason", "display")
+        ).lower()
+
+    hp = game_state.get("player_hp", 0)
+    max_hp = max(game_state.get("party", [{}])[0].get("max_hp", 0), 1) if game_state.get("party") else 1
+    low_hp = hp > 0 and hp / max_hp <= 0.3
+    wants_run = any(token in reason_text for token in ("run", "flee", "escape"))
+    if not wants_run and not low_hp:
+        return None
+
+    cursor = game_state.get("battle_action_cursor", 0)
+    button = _battle_action_button_toward(cursor, 3)
+    return {
+        "action": button,
+        "reason": "Structured battle: navigate the action menu toward Run using the live cursor state",
+        "display": "Trying to flee from battle.",
     }
 
 
@@ -493,12 +506,14 @@ def main():
             # Tier 1: Updates only when badge count changes
             check_tier1_update(progress, game_state)
 
-            # Tier 2: Updates every 100 actions, on map change, or battle enter/exit
+            # Tier 2: Updates every 50 actions or battle enter/exit.
+            # Do not force a refresh on ordinary map changes, or the strategy can
+            # thrash between neighboring maps (e.g. Route 1 <-> Viridian City).
             in_battle_now = current_game_state_str == "battle"
             planner_state = dict(game_state)
             planner_state["_progress_context"] = progress
-            if map_changed or entered_battle or exited_battle:
-                progress["tier2_last_action"] = action_count - 100  # guarantee trigger
+            if entered_battle or exited_battle:
+                progress["tier2_last_action"] = action_count - 50  # guarantee trigger
             check_tier2_update(progress, planner_state, action_count, in_battle=in_battle_now)
 
             # Tier 3: Updates every 25 actions (10 in battle), on map change, or battle enter/exit
@@ -632,8 +647,55 @@ def main():
             # 5. Choose next action.
             # Dialogue advancement is deterministic: if the game says dialogue is active,
             # advance it before asking either the nav layer or the LLM for movement.
-            if naming_action:
+            battle_menu_action = _get_battle_menu_action(game_state)
+            if battle_menu_action:
+                action = battle_menu_action
+                usage = {
+                    "model": "nav-state",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read": 0,
+                    "cache_creation": 0,
+                }
+            elif (
+                game_state.get("game_state") == "unknown"
+                and not game_state.get("in_battle", False)
+                and not game_state.get("in_dialogue", False)
+                and "POKECENTER" in game_state.get("map_name", "")
+            ):
+                action = {
+                    "action": "B",
+                    "reason": "Structured menu escape: unknown non-dialogue UI in a Pokemon Center, backing out with B",
+                    "display": "Backing out of an unknown Pokemon Center menu.",
+                }
+                usage = {
+                    "model": "nav-state",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read": 0,
+                    "cache_creation": 0,
+                }
+            elif naming_action:
                 action = naming_action
+                usage = {
+                    "model": "nav-state",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read": 0,
+                    "cache_creation": 0,
+                }
+            elif anti_stuck.in_random_recovery() and is_overworld:
+                anti_stuck.consume_random_recovery_turn()
+                button = random.choice(["Up", "Down", "Left", "Right"])
+                remaining = anti_stuck.random_recovery_remaining
+                action = {
+                    "action": button,
+                    "reason": (
+                        "Structured stuck recovery: no tile movement for 5 turns, "
+                        f"taking a random movement action ({remaining} recovery turns remain after this one)"
+                    ),
+                    "display": "Random recovery movement.",
+                }
                 usage = {
                     "model": "nav-state",
                     "input_tokens": 0,

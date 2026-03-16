@@ -129,6 +129,7 @@ local function handle_command(cmd)
         end
 
         local sb1 = ru32(0x03005008)
+        local sb2 = ru32(0x0300500C)
         local px = ru16(sb1 + 0x000)
         local py = ru16(sb1 + 0x002)
         local mapbank = ru8(sb1 + 0x004)
@@ -151,6 +152,8 @@ local function handle_command(cmd)
             [0x08135C35] = "transition",
             [0x08137EE9] = "summary",
             [0x08010509] = "transition",
+            [0x0809D9E1] = "nickname_prompt",
+            [0x0809FB71] = "naming",
         }
         local game_state_str = game_state_map[cb2] or "unknown"
         if game_state_str == "unknown" then
@@ -275,7 +278,8 @@ local function handle_command(cmd)
         end
 
         -- Key items and HMs needed for structured progression planning.
-        table.insert(results, has_item_in_pocket(0x3B8, 30, 260)) -- Pokedex
+        -- Base Kanto Pokedex candidate from SaveBlock2 diffing.
+        table.insert(results, (sb2 ~= 0 and ru8(sb2 + 0x00A8) ~= 0) and 1 or 0) -- Pokedex
         table.insert(results, has_item_in_pocket(0x3B8, 30, 349)) -- Oaks Parcel
         table.insert(results, has_any_item_in_pocket(0x3B8, 30, {264, 360})) -- S.S. Ticket
         table.insert(results, has_item_in_pocket(0x3B8, 30, 359)) -- Silph Scope
@@ -296,6 +300,7 @@ local function handle_command(cmd)
         table.insert(results, has_item_in_pocket(0x464, 64, 343)) -- HM05 Flash
         table.insert(results, has_item_in_pocket(0x464, 64, 344)) -- HM06 Rock Smash
         table.insert(results, has_item_in_pocket(0x464, 64, 345)) -- HM07 Waterfall
+        table.insert(results, (sb2 ~= 0 and ru8(sb2 + 0x001B) == 0xB9) and 1 or 0) -- National Dex enabled
 
         if battlers > 0 then
             local gBattleMons = 0x02023BE4

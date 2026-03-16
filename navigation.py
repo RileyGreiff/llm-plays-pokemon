@@ -79,6 +79,8 @@ class NavContext:
     selected_npc_reason: str = ""
     selected_object_reason: str = ""
     target_object_kind: str | None = None
+    target_object_last_pos: tuple[int, int] | None = None
+    moving_npc_cooldowns: dict[int, int] = field(default_factory=dict)
 
     def note_progress(self, world: WorldSnapshot) -> None:
         current_pos = (world.player_x, world.player_y)
@@ -96,10 +98,18 @@ class NavContext:
             self.selected_npc_reason = ""
             self.selected_object_reason = ""
             self.target_object_kind = None
+            self.target_object_last_pos = None
+            self.moving_npc_cooldowns.clear()
         elif current_pos == self.last_position:
             self.stalled_ticks += 1
         else:
             self.stalled_ticks = 0
+        if self.moving_npc_cooldowns:
+            updated = {}
+            for local_id, turns in self.moving_npc_cooldowns.items():
+                if turns > 1:
+                    updated[local_id] = turns - 1
+            self.moving_npc_cooldowns = updated
         self.last_map_id = world.map_id
         self.last_position = current_pos
 
@@ -524,6 +534,33 @@ def _choose_object_target(ctx: NavContext, world: WorldSnapshot) -> dict | None:
     objects = [obj for obj in (world.objects or []) if "Pokeball" not in obj.get("label", "")]
     if not objects:
         return None
+    eligible_objects = [
+        obj for obj in objects
+        if ctx.moving_npc_cooldowns.get(obj.get("local_id", -1), 0) <= 0
+    ]
+    if eligible_objects:
+        objects = eligible_objects
+
+    if world.map_name.endswith("POKECENTER_1F") or "MART" in world.map_name:
+        selected = sorted(
+            objects,
+            key=lambda obj: (obj["y"], abs(obj["x"] - world.player_x) + abs(obj["y"] - world.player_y)),
+        )[0]
+        ctx.selected_npc_reason = "Service-building counter NPC chosen before generic building randomization."
+        return selected
+
+    if is_probably_building(world.map_name, world.collision):
+        min_interactions = min(obj.get("interaction_count", 0) for obj in objects)
+        lowest_interaction = [
+            obj for obj in objects
+            if obj.get("interaction_count", 0) == min_interactions
+        ]
+        selected = random.choice(lowest_interaction)
+        ctx.selected_npc_reason = (
+            "Randomly chosen among the lowest-interaction NPCs in the building "
+            f"({min_interactions} prior talks)."
+        )
+        return selected
 
     candidates = []
     for obj in objects:
@@ -550,12 +587,6 @@ def _choose_object_target(ctx: NavContext, world: WorldSnapshot) -> dict | None:
             ctx.selected_npc_reason = choice.get("reason", "")
             return selected
 
-    if world.map_name.endswith("POKECENTER_1F") or "MART" in world.map_name:
-        return sorted(
-            objects,
-            key=lambda obj: (obj["y"], abs(obj["x"] - world.player_x) + abs(obj["y"] - world.player_y)),
-        )[0]
-
     return min(
         objects,
         key=lambda obj: abs(obj["x"] - world.player_x) + abs(obj["y"] - world.player_y),
@@ -569,6 +600,13 @@ def _visible_interactable_summary(world: WorldSnapshot) -> str:
     for event in (world.bg_events or [])[:8]:
         parts.append(f"{event.get('label', event.get('type', 'event'))}@({event['x']},{event['y']})")
     return ", ".join(parts)
+
+
+def _needs_healing(world: WorldSnapshot) -> bool:
+    if not world.party:
+        return False
+    lead = world.party[0]
+    return lead.get("hp", 0) < lead.get("max_hp", 0)
 
 
 def _has_non_npc_interactables(world: WorldSnapshot) -> bool:
@@ -588,6 +626,105 @@ def _has_trigger_or_item_interactable(world: WorldSnapshot) -> bool:
         if event.get("type") == "coord" or any(keyword in label for keyword in ("trigger", "item", "pokeball")):
             return True
     return False
+
+
+def _talk_to_npc_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
+    target = None
+    if ctx.target_object_id is not None:
+        target = next((obj for obj in (world.objects or []) if obj["local_id"] == ctx.target_object_id), None)
+        if target and target.get("interaction_count", 0) >= 3:
+            alternatives = [
+                obj for obj in (world.objects or [])
+                if obj["local_id"] != ctx.target_object_id and obj.get("interaction_count", 0) < target.get("interaction_count", 0)
+            ]
+            if alternatives:
+                target = None
+                ctx.target_object_id = None
+    if target is None:
+        target = _choose_object_target(ctx, world)
+        ctx.target_object_id = target["local_id"] if target else None
+    if not target:
+        return None
+    if ctx.target_object_id != target.get("local_id"):
+        ctx.target_object_last_pos = None
+    current_target_pos = (target["x"], target["y"])
+    if (
+        ctx.target_object_id == target.get("local_id")
+        and ctx.target_object_last_pos is not None
+        and ctx.target_object_last_pos != current_target_pos
+        and not world.in_dialogue
+    ):
+        ctx.moving_npc_cooldowns[target["local_id"]] = 3
+        ctx.target_object_id = None
+        ctx.target_object_last_pos = None
+        ctx.selected_npc_reason = "Previous NPC target was moving; trying a different NPC."
+        return decide_nav_action(ctx, world)
+    ctx.target_object_last_pos = current_target_pos
+
+    dist = abs(target["x"] - world.player_x) + abs(target["y"] - world.player_y)
+    if dist == 1:
+        if target.get("interaction_count", 0) >= 4 and not world.in_dialogue:
+            alternatives = [
+                obj for obj in (world.objects or [])
+                if obj.get("local_id") != target.get("local_id")
+                and obj.get("label") == "NPC"
+                and obj.get("interaction_count", 0) < target.get("interaction_count", 0)
+            ]
+            if alternatives:
+                ctx.target_object_id = None
+                ctx.selected_npc_reason = ""
+                ctx.intent = None
+                ctx.state = NavState.FREE_EXPLORE
+                ctx.llm_intent = None
+                ctx.llm_intent_reason = ""
+                ctx.llm_intent_key = None
+                return decide_nav_action(ctx, world)
+        ctx.state = NavState.BUILDING_TALK_TO_NPC
+        face_btn = facing_direction((world.player_x, world.player_y), (target["x"], target["y"]))
+        facing_map = {"Down": 1, "Up": 2, "Left": 3, "Right": 4}
+        if face_btn and world.player_facing != facing_map.get(face_btn):
+            return {
+                "action": face_btn,
+                "reason": (
+                    f"Structured nav: face the chosen NPC, then interact ({ctx.selected_npc_reason})"
+                    if ctx.selected_npc_reason else
+                    "Structured nav: face the NPC, then interact"
+                ),
+                "display": "Talking to the nearby NPC.",
+            }
+        return {
+            "action": "A",
+            "reason": (
+                f"Structured nav: interact with the chosen NPC ({ctx.selected_npc_reason})"
+                if ctx.selected_npc_reason else
+                "Structured nav: interact with the nearby NPC"
+            ),
+            "display": "Talking to the nearby NPC.",
+        }
+
+    ctx.state = NavState.BUILDING_PATH_TO_NPC
+    path, target_obj, target_pos = path_to_adjacent_object(
+        world.collision,
+        world.player_x,
+        world.player_y,
+        world.objects or [],
+        lambda obj: obj["local_id"] == ctx.target_object_id,
+    )
+    if target_obj:
+        ctx.target_object_id = target_obj["local_id"]
+        ctx.target_pos = target_pos
+    step = _follow_path(path)
+    if step:
+        return {
+            "action": step,
+            "reason": (
+                f"Structured nav: pathing next to the chosen NPC ({ctx.selected_npc_reason})"
+                if ctx.selected_npc_reason else
+                "Structured nav: pathing next to the target NPC"
+            ),
+            "display": "Walking over to an NPC.",
+        }
+    return None
 
 
 def _choose_interactable_target(ctx: NavContext, world: WorldSnapshot) -> dict | None:
@@ -715,8 +852,6 @@ def _step_away_from_object(world: WorldSnapshot, target: dict) -> str | None:
 
 def _goal_type_from_objective(world: WorldSnapshot) -> str:
     text = _combined_objective_text(world)
-    if _hp_ratio(world.party) <= 0.2:
-        return "heal"
     if any(keyword in text for keyword in ("heal", "pokecenter", "pokemon center", "nurse", "counter")):
         return "heal"
     if any(keyword in text for keyword in ("mart", "shop", "buy", "sell", "clerk")):
@@ -999,7 +1134,17 @@ def decide_nav_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
             "reason": "Structured nav: second step through the exit to leave the building",
             "display": "Stepping out of the building.",
         }
-    intent = infer_nav_intent(ctx, world)
+    if (
+        world.game_state == "overworld"
+        and not world.in_battle
+        and not world.in_dialogue
+        and world.objects
+        and ("POKECENTER" in world.map_name or "MART" in world.map_name)
+    ):
+        intent = "talk_to_npc"
+        ctx.intent = intent
+    else:
+        intent = infer_nav_intent(ctx, world)
     if ctx.force_leave_building:
         intent = "leave_building"
     if (
@@ -1035,6 +1180,7 @@ def decide_nav_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
     if intent != "talk_to_npc":
         ctx.target_object_id = None
         ctx.selected_npc_reason = ""
+        ctx.target_object_last_pos = None
     if intent != "interact_with_object":
         ctx.selected_object_reason = ""
         ctx.target_object_kind = None
@@ -1221,80 +1367,7 @@ def decide_nav_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
                 return None
 
     if intent == "talk_to_npc":
-        target = None
-        if ctx.target_object_id is not None:
-            target = next((obj for obj in (world.objects or []) if obj["local_id"] == ctx.target_object_id), None)
-            if target and target.get("interaction_count", 0) >= 3:
-                alternatives = [
-                    obj for obj in (world.objects or [])
-                    if obj["local_id"] != ctx.target_object_id and obj.get("interaction_count", 0) < target.get("interaction_count", 0)
-                ]
-                if alternatives:
-                    target = None
-                    ctx.target_object_id = None
-        if target is None:
-            target = _choose_object_target(ctx, world)
-            ctx.target_object_id = target["local_id"] if target else None
-        if not target:
-            return None
-
-        dist = abs(target["x"] - world.player_x) + abs(target["y"] - world.player_y)
-        if dist == 1:
-            if target.get("interaction_count", 0) >= 4 and not world.in_dialogue:
-                ctx.target_object_id = None
-                ctx.selected_npc_reason = ""
-                ctx.intent = None
-                ctx.state = NavState.FREE_EXPLORE
-                ctx.llm_intent = None
-                ctx.llm_intent_reason = ""
-                ctx.llm_intent_key = None
-                return decide_nav_action(ctx, world)
-            ctx.state = NavState.BUILDING_TALK_TO_NPC
-            face_btn = facing_direction((world.player_x, world.player_y), (target["x"], target["y"]))
-            facing_map = {"Down": 1, "Up": 2, "Left": 3, "Right": 4}
-            if face_btn and world.player_facing != facing_map.get(face_btn):
-                return {
-                    "action": face_btn,
-                    "reason": (
-                        f"Structured nav: face the chosen NPC, then interact ({ctx.selected_npc_reason})"
-                        if ctx.selected_npc_reason else
-                        "Structured nav: face the NPC, then interact"
-                    ),
-                    "display": "Talking to the nearby NPC.",
-                }
-            return {
-                "action": "A",
-                "reason": (
-                    f"Structured nav: interact with the chosen NPC ({ctx.selected_npc_reason})"
-                    if ctx.selected_npc_reason else
-                    "Structured nav: interact with the nearby NPC"
-                ),
-                "display": "Talking to the nearby NPC.",
-            }
-
-        ctx.state = NavState.BUILDING_PATH_TO_NPC
-        path, target_obj, target_pos = path_to_adjacent_object(
-            world.collision,
-            world.player_x,
-            world.player_y,
-            world.objects or [],
-            lambda obj: obj["local_id"] == ctx.target_object_id,
-        )
-        if target_obj:
-            ctx.target_object_id = target_obj["local_id"]
-            ctx.target_pos = target_pos
-        step = _follow_path(path)
-        if step:
-            return {
-                "action": step,
-                "reason": (
-                    f"Structured nav: pathing next to the chosen NPC ({ctx.selected_npc_reason})"
-                    if ctx.selected_npc_reason else
-                    "Structured nav: pathing next to the target NPC"
-                ),
-                "display": "Walking over to an NPC.",
-            }
-        return None
+        return _talk_to_npc_action(ctx, world)
 
     if intent == "interact_with_object":
         target = _choose_interactable_target(ctx, world)
@@ -1332,6 +1405,16 @@ def decide_nav_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
 
         dist = abs(target["x"] - world.player_x) + abs(target["y"] - world.player_y)
         if dist == 1:
+            if target.get("interaction_count", 0) >= 3 and not world.in_dialogue:
+                ctx.target_object_id = None
+                ctx.target_object_kind = None
+                ctx.selected_object_reason = ""
+                ctx.intent = None
+                ctx.state = NavState.FREE_EXPLORE
+                ctx.llm_intent = None
+                ctx.llm_intent_reason = ""
+                ctx.llm_intent_key = None
+                return decide_nav_action(ctx, world)
             ctx.state = NavState.INTERACT_OBJECT
             face_btn = facing_direction((world.player_x, world.player_y), (target["x"], target["y"]))
             facing_map = {"Down": 1, "Up": 2, "Left": 3, "Right": 4}
