@@ -132,45 +132,85 @@ def path_to_map_edge(collision_grid: tuple[int, int, list[str]],
     )
 
 
+def _bfs_to_targets(grid_w, grid_h, grid_rows, player_x, player_y,
+                    targets, max_steps):
+    """BFS from player to any target tile. Returns (path, obj, pos) or Nones."""
+    if not targets:
+        return None, None, None
+    start = (player_x, player_y)
+    queue = deque([(start, [])])
+    seen = {start}
+    target_lookup = {(tx, ty): obj for tx, ty, obj in targets}
+
+    while queue:
+        (cx, cy), path = queue.popleft()
+        if (cx, cy) in target_lookup:
+            return path[:max_steps], target_lookup[(cx, cy)], (cx, cy)
+        if len(path) >= max_steps:
+            continue
+        for dir_name, dx, dy in _neighbors():
+            nx, ny = cx + dx, cy + dy
+            if 0 <= nx < grid_w and 0 <= ny < grid_h and (nx, ny) not in seen:
+                if is_passable(grid_rows[ny][nx]):
+                    seen.add((nx, ny))
+                    queue.append(((nx, ny), path + [dir_name]))
+    return None, None, None
+
+
+def _counter_talk_targets(grid_w, grid_h, grid_rows, objects, match_fn):
+    """Find tiles 2 away from an NPC across a blocked counter tile."""
+    targets = []
+    for obj in objects or []:
+        if not match_fn(obj):
+            continue
+        for _, dx, dy in _neighbors():
+            mid_x, mid_y = obj["x"] + dx, obj["y"] + dy
+            tx, ty = obj["x"] + dx * 2, obj["y"] + dy * 2
+            if (0 <= mid_x < grid_w and 0 <= mid_y < grid_h
+                    and 0 <= tx < grid_w and 0 <= ty < grid_h
+                    and not is_passable(grid_rows[mid_y][mid_x])
+                    and is_passable(grid_rows[ty][tx])):
+                targets.append((tx, ty, obj))
+    return targets
+
+
 def path_to_adjacent_object(collision_grid: tuple[int, int, list[str]],
                             player_x: int, player_y: int,
                             objects: list[dict],
                             match_fn,
                             max_steps: int = 40) -> tuple[list[str], dict, tuple[int, int]] | tuple[None, None, None]:
-    """Path to a walkable tile adjacent to the first matching object."""
+    """Path to a walkable tile adjacent to the first matching object.
+
+    Also considers tiles 2 away across a counter (blocked tile), since
+    FireRed allows talking across counters.
+    """
     try:
         grid_w, grid_h, grid_rows = collision_grid
-        targets: list[tuple[int, int, dict]] = []
+
+        # 1. Direct adjacency targets (1 tile away, walkable)
+        direct_targets: list[tuple[int, int, dict]] = []
         for obj in objects or []:
             if not match_fn(obj):
                 continue
             for _, dx, dy in _neighbors():
                 tx, ty = obj["x"] + dx, obj["y"] + dy
                 if 0 <= tx < grid_w and 0 <= ty < grid_h and is_passable(grid_rows[ty][tx]):
-                    targets.append((tx, ty, obj))
+                    direct_targets.append((tx, ty, obj))
 
-        if not targets:
-            return None, None, None
+        # 2. Try BFS to direct targets first
+        if direct_targets:
+            result = _bfs_to_targets(grid_w, grid_h, grid_rows, player_x, player_y,
+                                     direct_targets, max_steps)
+            if result[0] is not None:
+                return result
 
-        start = (player_x, player_y)
-        queue = deque([(start, [])])
-        seen = {start}
-        target_lookup = {(tx, ty): obj for tx, ty, obj in targets}
-
-        while queue:
-            (cx, cy), path = queue.popleft()
-            if (cx, cy) in target_lookup:
-                return path[:max_steps], target_lookup[(cx, cy)], (cx, cy)
-
-            if len(path) >= max_steps:
-                continue
-
-            for dir_name, dx, dy in _neighbors():
-                nx, ny = cx + dx, cy + dy
-                if 0 <= nx < grid_w and 0 <= ny < grid_h and (nx, ny) not in seen:
-                    if is_passable(grid_rows[ny][nx]):
-                        seen.add((nx, ny))
-                        queue.append(((nx, ny), path + [dir_name]))
+        # 3. Direct targets unreachable or none — try counter-talk (2 tiles away)
+        counter_targets = _counter_talk_targets(grid_w, grid_h, grid_rows, objects, match_fn)
+        if counter_targets:
+            result = _bfs_to_targets(grid_w, grid_h, grid_rows, player_x, player_y,
+                                     counter_targets, max_steps)
+            if result[0] is not None:
+                return result
 
         return None, None, None
     except Exception:
