@@ -8,6 +8,7 @@ from claude_client import classify_navigation_intent, select_building_door, sele
 from exploration import (
     edge_exit_action,
     facing_direction,
+    is_counter_talk_position,
     is_passable,
     path_to_adjacent_object,
     path_to_map_edge,
@@ -662,7 +663,12 @@ def _talk_to_npc_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
     ctx.target_object_last_pos = current_target_pos
 
     dist = abs(target["x"] - world.player_x) + abs(target["y"] - world.player_y)
-    if dist == 1:
+    across_counter = (
+        dist == 2
+        and world.collision is not None
+        and is_counter_talk_position(world.collision, world.player_x, world.player_y, target["x"], target["y"])
+    )
+    if dist == 1 or across_counter:
         if target.get("interaction_count", 0) >= 4 and not world.in_dialogue:
             alternatives = [
                 obj for obj in (world.objects or [])
@@ -680,7 +686,13 @@ def _talk_to_npc_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
                 ctx.llm_intent_key = None
                 return decide_nav_action(ctx, world)
         ctx.state = NavState.BUILDING_TALK_TO_NPC
-        face_btn = facing_direction((world.player_x, world.player_y), (target["x"], target["y"]))
+        # For counter-talk, face toward the counter (midpoint) since facing_direction only handles dist=1
+        if across_counter:
+            mid = (world.player_x + (target["x"] - world.player_x) // 2,
+                   world.player_y + (target["y"] - world.player_y) // 2)
+            face_btn = facing_direction((world.player_x, world.player_y), mid)
+        else:
+            face_btn = facing_direction((world.player_x, world.player_y), (target["x"], target["y"]))
         facing_map = {"Down": 1, "Up": 2, "Left": 3, "Right": 4}
         if face_btn and world.player_facing != facing_map.get(face_btn):
             return {
@@ -1140,6 +1152,7 @@ def decide_nav_action(ctx: NavContext, world: WorldSnapshot) -> dict | None:
         and not world.in_dialogue
         and world.objects
         and ("POKECENTER" in world.map_name or "MART" in world.map_name)
+        and (ctx.selected_goal_type in ("heal", "shop") or _needs_healing(world))
     ):
         intent = "talk_to_npc"
         ctx.intent = intent

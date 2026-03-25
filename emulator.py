@@ -21,6 +21,16 @@ RESP_FILE = os.path.join(BRIDGE_DIR, "response.txt")
 READY_FILE = os.path.join(BRIDGE_DIR, "ready.txt")
 
 
+def set_bridge_dir(bridge_dir: str):
+    """Configure bridge directory for this process (used by parallel workers)."""
+    global BRIDGE_DIR, CMD_FILE, RESP_FILE, READY_FILE
+    BRIDGE_DIR = bridge_dir
+    CMD_FILE = os.path.join(BRIDGE_DIR, "command.txt")
+    RESP_FILE = os.path.join(BRIDGE_DIR, "response.txt")
+    READY_FILE = os.path.join(BRIDGE_DIR, "ready.txt")
+    os.makedirs(BRIDGE_DIR, exist_ok=True)
+
+
 def _send_command(command: str, timeout: float = 10.0) -> str:
     """Send a command to BizHawk via file and wait for response."""
     # Clean up any stale response
@@ -255,6 +265,26 @@ def screenshot() -> Image.Image:
     raw = _send_command("SCREENSHOT")
     img_bytes = base64.b64decode(raw)
     return Image.open(io.BytesIO(img_bytes))
+
+
+def load_savestate(path: str) -> bool:
+    """Load a BizHawk savestate file. Returns True on success."""
+    try:
+        result = _send_command(f"LOADSTATE {path}", timeout=15.0)
+        return result == "OK"
+    except (TimeoutError, OSError) as e:
+        print(f"  [savestate] Load failed: {e}")
+        return False
+
+
+def save_savestate(path: str) -> bool:
+    """Save a BizHawk savestate file. Returns True on success."""
+    try:
+        result = _send_command(f"SAVESTATE {path}", timeout=15.0)
+        return result == "OK"
+    except (TimeoutError, OSError) as e:
+        print(f"  [savestate] Save failed: {e}")
+        return False
 
 
 def press_button(button: str, frames: int = 16) -> None:

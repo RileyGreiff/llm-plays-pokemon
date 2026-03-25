@@ -341,14 +341,43 @@ def _infer_progress_blockers(game_state: dict) -> str:
     return "Progress interpretation notes:\n- " + "\n- ".join(notes)
 
 
+def _format_compact_progress(game_state: dict) -> str:
+    """Compact single-block progress summary replacing 4 separate format functions."""
+    # Key items: only show owned and first missing
+    item_checks = [
+        ("Oak's Parcel", game_state.get("has_oaks_parcel", False)),
+        ("Pokedex", game_state.get("has_pokedex", False)),
+        ("S.S. Ticket", game_state.get("has_ss_ticket", False)),
+        ("HM01 Cut", game_state.get("has_hm01_cut", False)),
+        ("Lift Key", game_state.get("has_lift_key", False)),
+        ("Silph Scope", game_state.get("has_silph_scope", False)),
+        ("Poké Flute", game_state.get("has_poke_flute", False)),
+        ("Tea", game_state.get("has_tea", False)),
+        ("Card Key", game_state.get("has_card_key", False)),
+        ("HM03 Surf", game_state.get("has_hm03_surf", False)),
+        ("Gold Teeth", game_state.get("has_gold_teeth", False)),
+        ("HM04 Strength", game_state.get("has_hm04_strength", False)),
+        ("Secret Key", game_state.get("has_secret_key", False)),
+    ]
+    owned = [name for name, has in item_checks if has]
+    first_missing = next((name for name, has in item_checks if not has), None)
+
+    lines = []
+    lines.append(f"Badges: {game_state.get('badges', 0)}/8")
+    if owned:
+        lines.append(f"Owned: {', '.join(owned)}")
+    if first_missing:
+        hint = ITEM_LOCATION_HINTS.get(first_missing, "")
+        loc = f" ({hint})" if hint else ""
+        lines.append(f"Next needed: {first_missing}{loc}")
+    if not game_state.get("party"):
+        lines.append("Party is empty — get first Pokemon!")
+    return "\n".join(lines)
+
+
 def rethink_tier2(game_state: dict, tier1_objective: str, in_battle: bool = False, previous_strategy: str = "") -> str:
     """Use Sonnet to determine the mid-level strategy."""
     party_str = _format_party_with_moves(game_state)
-    progress_facts = _format_progress_facts(game_state)
-    required_item_order = _format_required_item_order(game_state)
-    next_required_item = _format_next_required_item(game_state)
-    item_location_hints = _format_item_location_hints()
-    progress_blockers = _infer_progress_blockers(game_state)
     badges = game_state.get("badges", 0)
     map_name = game_state.get("map_name", "?")
 
@@ -358,56 +387,25 @@ def rethink_tier2(game_state: dict, tier1_objective: str, in_battle: bool = Fals
         enemy_hp = game_state.get("enemy_hp", "?")
         battle_moves = _format_battle_moves(game_state)
         prompt = (
-            f"You are a Pokemon FireRed battle advisor. "
-            f"Player is in battle on {map_name}.\n"
+            f"Pokemon FireRed battle advisor. Battle on {map_name}.\n"
             f"Enemy: Lv{enemy_level} (species#{enemy}) HP:{enemy_hp}\n"
             f"Party: {party_str}\n"
             f"{battle_moves}\n"
-            f"{progress_facts}\n"
-            f"What battle strategy should the player use? Consider:\n"
-            f"- Moves with 0 PP are unusable and should not be recommended.\n"
-            f"- Which moves are super effective or strong against this enemy?\n"
-            f"- Should the player fight to train, or flee to conserve HP?\n"
-            f"- Is HP low enough to need healing items?\n\n"
+            f"0 PP moves are unusable. Consider type effectiveness, fight vs flee, HP status.\n"
             f"Reply with ONE concise battle strategy sentence."
         )
     else:
+        progress = _format_compact_progress(game_state)
         prompt = (
-            f"You are a Pokemon FireRed strategy advisor. "
-            f"Current goal: {tier1_objective}\n"
-            f"Player location: {map_name}\n"
-            f"Badges: {badges}\n"
-            f"Party: {party_str}\n"
-            f"{progress_facts}\n"
-            f"{required_item_order}\n"
-            f"{next_required_item}\n"
-            f"{item_location_hints}\n"
-            f"{progress_blockers}\n\n"
-            f"Based on your knowledge of Pokemon FireRed, what should the player focus on RIGHT NOW "
-            f"to make progress toward the goal? Consider:\n"
-            f"- These progression facts are authoritative. Do NOT assume the player owns missing key items or HMs.\n"
-            f"- Infer the next quest from BOTH the important items/HMs the player already has and the important ones they still do not have.\n"
-            f"- Missing progression items often indicate which required story quest has not been completed yet.\n"
-            f"- Respect the ordered main-story item chain above; if an earlier required item is still missing, it usually takes priority over later story rewards.\n"
-            f"- Strongly prioritize the earliest missing required story item named above when choosing the next strategy.\n"
-            f"- Do not recommend a later reward item or story step before the earliest missing required item is addressed.\n"
-            f"- Never state an item source unless it is directly implied by the earliest missing-item progression step.\n"
-            f"- Use the canonical FireRed item-location hints above when deciding where the player should go for a missing required item.\n"
-            f"- Visible room objects are weak evidence for global story-item location; do not assume a nearby item ball or object is the missing required story item unless the progression step directly implies it.\n"
-            f"- Use local objects mainly to choose how to execute an already-known local task, not to infer the overall story quest source.\n"
-            f"- Prefer naming the next destination or quest step over giving cardinal directions across multiple maps.\n"
-            f"- Only mention a direction like north/south/east/west if it is the immediate local move from the current map and you are confident it is correct.\n"
-            f"- If the party is empty, acquiring the first Pokemon is the highest priority before any later story or gym objective.\n"
-            f"- Use your knowledge of Pokemon FireRed story progression to infer any unmet prerequisites from the current items, badges, HMs, location, and party.\n"
-            f"- If a required story or item prerequisite is still missing, prioritize clearing that prerequisite before recommending gym progression.\n"
-            f"- Only recommend actions that are consistent with the authoritative facts above.\n"
-            f"- Do not rely on generic 'early-game' assumptions; base the strategy only on the explicit facts and required-item ordering shown above.\n"
-            f"- Is the party strong enough to challenge the next gym?\n"
-            f"- Does the player need to catch more Pokemon for type coverage?\n"
-            f"- Are there required HMs or key items needed to progress?\n"
-            f"- Does the player need to train or grind levels first?\n"
-            f"- Are there story events that must be completed first?\n\n"
-            f"Reply with ONE concise strategy sentence (what to do and why)."
+            f"Pokemon FireRed strategy advisor.\n"
+            f"Goal: {tier1_objective}\n"
+            f"Location: {map_name} | Party: {party_str}\n"
+            f"{progress}\n\n"
+            f"Rules: Progression facts are authoritative — do not assume missing items are owned. "
+            f"Prioritize the earliest missing story item before later steps. "
+            f"Name the next destination, not multi-map directions.\n"
+            f"What should the player focus on RIGHT NOW? "
+            f"Reply with ONE concise strategy sentence."
         )
 
     response = client.messages.create(
@@ -440,59 +438,31 @@ def check_tier2_update(progress: dict, game_state: dict, action_count: int, in_b
 def rethink_objective(game_state: dict, tier2_objective: str = "", in_battle: bool = False) -> str:
     """Use Sonnet to determine the immediate next step, informed by tier 2 strategy."""
     party_str = _format_party_with_moves(game_state)
-    progress_facts = _format_progress_facts(game_state)
-    required_item_order = _format_required_item_order(game_state)
-    next_required_item = _format_next_required_item(game_state)
-    item_location_hints = _format_item_location_hints()
-    progress_blockers = _infer_progress_blockers(game_state)
-    visited_areas = _format_maps_visited(game_state.get("_progress_context", {}))
     strategy_context = (
         f"\nBattle strategy: {tier2_objective}" if tier2_objective and in_battle
-        else f"\nCurrent strategy: {tier2_objective}" if tier2_objective else ""
+        else f"\nStrategy: {tier2_objective}" if tier2_objective else ""
     )
 
     if in_battle:
         battle_moves = _format_battle_moves(game_state)
         prompt = (
-            f"You are guiding a Pokemon FireRed battle. "
-            f"Party: {party_str}.\n"
-            f"{battle_moves}\n"
-            f"{progress_facts}"
-            f"{strategy_context} "
-            f"Moves with 0 PP are unusable. "
-            f"What should the player do RIGHT NOW in this battle turn? "
+            f"Pokemon FireRed battle. Party: {party_str}.\n"
+            f"{battle_moves}"
+            f"{strategy_context}\n"
+            f"0 PP moves are unusable. What should the player do RIGHT NOW? "
             f"Reply with ONLY one specific, actionable sentence."
         )
     else:
+        progress = _format_compact_progress(game_state)
+        visited_areas = _format_maps_visited(game_state.get("_progress_context", {}))
         prompt = (
-            f"You are guiding a Pokemon FireRed playthrough. "
-            f"The player is currently in {game_state.get('map_name', '?')} "
-            f"with {game_state.get('badges', 0)} badges "
-            f"and this party: {party_str}.\n"
-            f"{progress_facts}\n"
-            f"{required_item_order}\n"
-            f"{next_required_item}\n"
-            f"{item_location_hints}\n"
-            f"{progress_blockers}"
-            f"\n{visited_areas}"
-            f"{strategy_context} "
-            f"Treat the progression facts above as authoritative. Do not assume missing key items or HMs are already owned. "
-            f"Infer the immediate next quest step from BOTH the important progression items/HMs the player has and the ones they are still missing. "
-            f"Use missing progression items as evidence for which required story quest is currently incomplete. "
-            f"Respect the ordered main-story item chain above; if an earlier required item is still missing, it usually blocks later story rewards. "
-            f"Strongly prioritize the earliest missing required story item named above when choosing the immediate task. "
-            f"Do not recommend pursuing a later reward item or story step before that earliest missing required item is addressed. "
-            f"Never state an item source unless it is directly implied by the earliest missing-item progression step. "
-            f"Use the canonical FireRed item-location hints above when deciding the next destination for a missing required item. "
-            f"Visible room objects are weak evidence for global story-item location; do not assume a nearby item ball or object is the missing required story item unless the progression step directly implies it. "
-            f"Use local objects mainly to execute an already-known local task, not to infer the overall quest source. "
-            f"Do not rely on generic 'early-game' assumptions; base the immediate task only on the explicit facts and required-item ordering shown above. "
-            f"Describe only the next local step from the current map; do not bundle multiple later map transitions into one task sentence. "
-            f"Only mention a cardinal direction if it is the immediate local move from the current map and you are confident it is correct. "
-            f"If the party is empty, the immediate task should focus on obtaining the first Pokemon before any later progression. "
-            f"Use your knowledge of Pokemon FireRed to infer the next necessary local step from the current location, story state, items, badges, HMs, and party. "
-            f"Only recommend an immediate action that is consistent with those facts. "
-            f"What is the immediate next step the player should take right now? "
+            f"Pokemon FireRed playthrough. "
+            f"Location: {game_state.get('map_name', '?')} | Party: {party_str}\n"
+            f"{progress}\n"
+            f"{visited_areas}"
+            f"{strategy_context}\n"
+            f"Describe only the next local step from the current map. "
+            f"Prioritize the earliest missing story item. "
             f"Reply with ONLY one specific, actionable sentence."
         )
 

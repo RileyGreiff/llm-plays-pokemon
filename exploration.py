@@ -157,6 +157,22 @@ def _bfs_to_targets(grid_w, grid_h, grid_rows, player_x, player_y,
     return None, None, None
 
 
+def is_counter_talk_position(collision_grid: tuple[int, int, list[str]],
+                             player_x: int, player_y: int,
+                             npc_x: int, npc_y: int) -> bool:
+    """Return True if player is 2 tiles from NPC with a blocked counter tile between them."""
+    dx = npc_x - player_x
+    dy = npc_y - player_y
+    if abs(dx) + abs(dy) != 2 or (dx != 0 and dy != 0):
+        return False  # must be exactly 2 tiles in a cardinal direction
+    grid_w, grid_h, grid_rows = collision_grid
+    mid_x = player_x + dx // 2
+    mid_y = player_y + dy // 2
+    if 0 <= mid_x < grid_w and 0 <= mid_y < grid_h:
+        return not is_passable(grid_rows[mid_y][mid_x])
+    return False
+
+
 def _counter_talk_targets(grid_w, grid_h, grid_rows, objects, match_fn):
     """Find tiles 2 away from an NPC across a blocked counter tile."""
     targets = []

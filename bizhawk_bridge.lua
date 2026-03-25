@@ -10,13 +10,16 @@ local overlay_text = ""
 local overlay_action = ""
 
 -- File-based communication paths
-local BRIDGE_DIR = "bridge"
+-- Override BRIDGE_DIR by setting environment variable BIZHAWK_BRIDGE_DIR
+-- or by editing this line. For parallel training use bridge_0, bridge_1, etc.
+local BRIDGE_DIR = os.getenv("BIZHAWK_BRIDGE_DIR") or "bridge"
 local CMD_FILE = BRIDGE_DIR .. "/command.txt"
 local RESP_FILE = BRIDGE_DIR .. "/response.txt"
 local READY_FILE = BRIDGE_DIR .. "/ready.txt"
 
 -- Create bridge directory
-os.execute("mkdir " .. BRIDGE_DIR .. " 2>NUL")
+os.execute("mkdir \"" .. BRIDGE_DIR .. "\" 2>NUL")
+console.log("Bridge directory: " .. BRIDGE_DIR)
 
 -- Non-blocking button press state
 local pending_button = nil
@@ -154,6 +157,8 @@ local function handle_command(cmd)
             [0x08010509] = "transition",
             [0x0809D9E1] = "nickname_prompt",
             [0x0809FB71] = "naming",
+            [0x0809ADE5] = "shop_buy",
+            [0x0809AE15] = "shop_buy",
         }
         local game_state_str = game_state_map[cb2] or "unknown"
         if game_state_str == "unknown" then
@@ -700,6 +705,27 @@ local function handle_command(cmd)
         end
 
         return map_w .. "," .. map_h .. "|" .. table.concat(rows)
+
+    elseif cmd:sub(1, 9) == "LOADSTATE" then
+        local path = cmd:sub(11)
+        if path == "" then
+            return "ERROR:no_path"
+        end
+        local f = io.open(path, "r")
+        if not f then
+            return "ERROR:file_not_found:" .. path
+        end
+        f:close()
+        savestate.load(path)
+        return "OK"
+
+    elseif cmd:sub(1, 9) == "SAVESTATE" then
+        local path = cmd:sub(11)
+        if path == "" then
+            return "ERROR:no_path"
+        end
+        savestate.save(path)
+        return "OK"
 
     else
         return "ERROR: unknown command '" .. cmd .. "'"

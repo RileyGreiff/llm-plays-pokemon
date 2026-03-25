@@ -780,3 +780,37 @@ ITEM_NAMES = {
     146: "Aguav Berry", 147: "Iapapa Berry",
     175: "Liechi Berry", 176: "Ganlon Berry", 177: "Salac Berry", 178: "Petaya Berry",
 }
+
+# --- Story flag system (SaveBlock1 flag bit array) ---
+# Flags are stored as a bit array at SaveBlock1 + 0xEE0
+# To check flag N: read byte at SB1 + 0xEE0 + (N // 8), test bit (N % 8)
+SB1_FLAGS_OFFSET = 0xEE0
+
+# System flags (0x800+)
+FLAG_SYS_POKEMON_GET = 0x800        # player has at least one pokemon
+FLAG_SYS_POKEDEX_GET = 0x801        # player has pokedex
+FLAG_SYS_POKENAV_GET = 0x802        # has pokenav (unused in FRLG)
+FLAG_SYS_NATIONAL_DEX = 0x804       # national dex unlocked
+
+# Badge flags
+FLAG_BADGE01_GET = 0x820  # Boulder Badge (Brock)
+FLAG_BADGE02_GET = 0x821  # Cascade Badge (Misty)
+FLAG_BADGE03_GET = 0x822  # Thunder Badge (Surge)
+FLAG_BADGE04_GET = 0x823  # Rainbow Badge (Erika)
+FLAG_BADGE05_GET = 0x824  # Soul Badge (Koga)
+FLAG_BADGE06_GET = 0x825  # Marsh Badge (Sabrina)
+FLAG_BADGE07_GET = 0x826  # Volcano Badge (Blaine)
+FLAG_BADGE08_GET = 0x827  # Earth Badge (Giovanni)
+
+# Story progression flags (from pokefirered decomp)
+FLAG_GOT_STARTER = 0x102            # chose starter in Oak's lab
+FLAG_GOT_OAKS_PARCEL = 0x121       # picked up parcel from Viridian Mart
+FLAG_DELIVERED_OAKS_PARCEL = 0x122  # gave parcel to Oak
+FLAG_GOT_POKEDEX = 0x123            # received pokedex from Oak
+FLAG_HIDE_ROUTE22_RIVAL = 0x159     # rival on route 22 beaten/gone
+
+# Trainer defeated flags (set when trainer beaten, prevents rematches)
+FLAG_TRAINER_BROCK = 0x149          # Brock defeated
+
+# Item IDs relevant to progression detection
+ITEM_OAKS_PARCEL = 349

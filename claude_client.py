@@ -248,32 +248,19 @@ def classify_navigation_intent(map_name: str,
     Returns {"intent": str, "reason": str} or None on failure.
     """
     prompt = (
-        "You are helping an AI agent play Pokemon FireRed.\n"
-        "Choose the SINGLE best immediate overworld navigation intent.\n"
-        "Allowed intents: go_to_building, go_to_route_exit, talk_to_npc, interact_with_object, leave_building, train, none.\n\n"
-        f"Current map: {map_name}\n"
-        f"Map type: {'indoor' if indoor else 'outdoor'}\n"
-        f"Current objective: {current_objective or '(none)'}\n"
-        f"Strategy objective: {strategy_objective or '(none)'}\n"
-        f"Lead HP ratio: {hp_ratio:.2f}\n"
-        f"Party count: {party_count}\n"
-        f"Visible doors/exits on map: {visible_doors}\n"
-        f"Visible objects/NPCs on map: {visible_objects}\n"
-        f"Visible interactables summary: {visible_summary or 'none'}\n"
-        f"Current nav state: {current_state}\n"
-        f"Previous nav intent: {previous_intent or 'none'}\n\n"
-        "Rules:\n"
-        "- If the player has reached the destination area and now needs a local building or NPC, prefer go_to_building or talk_to_npc over go_to_route_exit.\n"
-        "- If the player has no Pokemon yet and there are nearby non-NPC interactables or trigger tiles, prefer interact_with_object over leaving.\n"
-        "- If the player is inside a Pokemon Center and still needs service from the counter/nurse, prefer talk_to_npc over leaving or wandering.\n"
-        "- If the player is inside a Mart and still needs to buy, sell, or receive a story item from the clerk, prefer talk_to_npc over leaving or wandering.\n"
-        "- Use interact_with_object when the best next step is to step onto or inspect a nearby trigger, item, sign, or other non-NPC interactable.\n"
-        "- Use leave_building when inside the wrong building or when the objective is to go outside.\n"
-        "- Use go_to_route_exit only when the best next step is leaving the current map.\n"
-        "- Use talk_to_npc when already in the correct building or standing at the relevant NPC/counter.\n"
-        "- Use train only when the objective is clearly about training or wild encounters.\n"
-        "- Use none if no structured intent clearly applies.\n\n"
-        'Reply ONLY with JSON like {"intent":"go_to_building","reason":"Need to find Oak\'s Lab in the current town."}'
+        "Pokemon FireRed AI agent navigation. Choose ONE intent.\n"
+        "Intents: go_to_building, go_to_route_exit, talk_to_npc, interact_with_object, leave_building, train, none.\n\n"
+        f"Map: {map_name} ({'indoor' if indoor else 'outdoor'}) | HP: {hp_ratio:.0%} | Party: {party_count}\n"
+        f"Objective: {current_objective or '(none)'}\n"
+        f"Strategy: {strategy_objective or '(none)'}\n"
+        f"Doors/exits: {visible_doors} | Objects/NPCs: {visible_objects}\n"
+        f"Interactables: {visible_summary or 'none'}\n"
+        f"Nav state: {current_state} | Previous: {previous_intent or 'none'}\n\n"
+        "Rules: At destination, prefer building/NPC over route_exit. "
+        "In Pokecenter/Mart needing service, prefer talk_to_npc. "
+        "No Pokemon + nearby triggers = interact_with_object. "
+        "Wrong building = leave_building. train = only for grinding.\n\n"
+        'Reply ONLY with JSON: {"intent":"...","reason":"..."}'
     )
 
     try:
@@ -603,6 +590,23 @@ def build_messages(game_state: dict,
                 f"{party_info}{dialogue_line}"
             )
 
+    elif gstate == "shop_buy":
+        bag = gs.get("bag_items")
+        money = gs.get("money", "?")
+        items_display = ""
+        if bag:
+            pocket_key = "Items"
+            items = bag["pockets"].get(pocket_key, [])
+            if items:
+                item_lines = [f"    {it['name']} x{it['quantity']}" for it in items[:8]]
+                items_display = "\nYour items: " + ", ".join(f"{it['name']} x{it['quantity']}" for it in items[:8])
+        parts.append(
+            f"=== POKEMART BUY MENU ===\n"
+            f"Money: ${money}{items_display}\n"
+            f"You're in the buy menu. Up/Down = select item. A = buy. B = cancel/exit."
+            f"{party_info}{dialogue_line}"
+        )
+
     elif gstate == "pokemon":
         parts.append(
             f"=== POKEMON MENU (in battle) ===\n"
@@ -667,7 +671,7 @@ def get_action(game_state: dict,
 
     response = client.messages.create(
         model=model,
-        max_tokens=400,
+        max_tokens=150,
         system=[{
             "type": "text",
             "text": SYSTEM_PROMPT,
