@@ -15,16 +15,6 @@ SYSTEM_PROMPT = """You are an AI playing Pokemon FireRed (GBA). Your goal: earn 
 
 You receive STRUCTURED DATA about the game state. The header tells you what mode you're in.
 
-OVERWORLD CONTROLS:
-- A: interact, advance dialogue. If Dialogue is True, press A first.
-- But if pressing A repeatedly is not changing the situation, stop repeating A and try a different action.
-- Do NOT move into walls. Check ADJACENT TILES — only move in directions marked "walkable" or "door" or "stairs" or "map edge".
-- Prioritize unvisited tiles. Avoid overvisited tiles.
-- Do NOT walk back onto any tile you visited in your last 3 moves — keep moving forward.
-- INTERACT with nearby objects marked [NOT yet interacted] — walk toward them and press A.
-- Indoor exits (1F): usually south. Outdoor exits: walk to map edge.
-- Read DIALOGUE TEXT carefully — NPCs give hints about what to do next.
-
 BATTLE CONTROLS:
 - You see the battle action menu (Fight/Bag/Pokemon/Run) and your moves with PP.
 - Use Left/Right/Up/Down to move the cursor, A to confirm selection.
@@ -37,6 +27,26 @@ BAG/POKEMON/SUMMARY: Press B to go back.
 
 Respond ONLY with valid JSON:
 {"action": "<button>", "reason": "<why, under 40 words>", "display": "<casual 25-word viewer summary>"}"""
+
+NAV_SYSTEM_PROMPT = """You are an AI playing Pokemon FireRed (GBA). Your goal: earn all 8 badges and defeat the Elite Four.
+
+You receive a list of NEARBY EXITS and NPCs. Pick a TARGET to navigate to. The game will pathfind there automatically.
+
+RULES:
+- Choose a target that advances your current objective.
+- Exits labeled "unknown" haven't been explored yet — explore them if they might lead somewhere useful.
+- NPCs labeled "unknown" haven't been talked to yet — talk to them if your objective involves NPCs.
+- If you're in the wrong area, pick the exit that leads toward your destination.
+- If you need to heal, go to a Pokemon Center.
+- Read NPC dialogue summaries to decide if you need to talk to them again.
+
+TARGET TYPES:
+- "door:X,Y" — walk to a door/stairs tile and enter it
+- "npc:ID" — walk to an NPC and talk to them
+- "edge:DIRECTION" — walk to the map edge to leave (north/south/east/west)
+
+Respond ONLY with valid JSON:
+{"target": "<target_id>", "reason": "<why, under 40 words>", "display": "<casual 25-word viewer summary>"}"""
 
 client = anthropic.Anthropic()
 
@@ -87,205 +97,37 @@ def generate_pokemon_nickname(species_name: str = "", theme: str = "") -> str:
     return random.choice(_NICKNAME_FALLBACKS)
 
 
-def select_building_door(map_name: str,
-                         objective: str,
-                         player_pos: tuple[int, int],
-                         candidates: list[dict],
-                         rejected: list[tuple[int, int]] | None = None,
-                         discoveries: list[dict] | None = None) -> dict | None:
-    """Ask Claude to choose the most likely building entrance for the current goal.
+def get_navigation_target(exploration_summary: str,
+                          progress_summary: str) -> dict | None:
+    """Ask Claude to pick a navigation target from the exploration summary.
 
-    Returns {"x": int, "y": int, "reason": str} or None on failure.
-    """
-    if not candidates:
-        return None
-
-    rejected = rejected or []
-    discoveries = discoveries or []
-    candidate_lines = []
-    for idx, cand in enumerate(candidates, start=1):
-        label = cand.get("label", "unknown")
-        candidate_lines.append(
-            f"{idx}. door at ({cand['x']},{cand['y']}) distance {cand['distance']} steps"
-            f" discovered_as={label}"
-        )
-
-    rejected_text = ", ".join(f"({x},{y})" for x, y in rejected) if rejected else "none"
-    discovery_lines = []
-    for discovery in discoveries:
-        discovery_lines.append(
-            f"- ({discovery['x']},{discovery['y']}) -> {discovery['map_name']}"
-        )
-    discovery_text = chr(10).join(discovery_lines) if discovery_lines else "- none yet"
-    prompt = (
-        "You are helping an AI agent play Pokemon FireRed.\n"
-        f"Current outdoor map: {map_name}\n"
-        f"Current objective: {objective}\n"
-        f"Player position: ({player_pos[0]},{player_pos[1]})\n"
-        "Choose the most likely correct building entrance based on your knowledge of FireRed town layouts.\n"
-        "Use the discovered buildings below as learned facts. Prefer an unknown door when known doors do not match the goal.\n"
-        "Discovered building entrances on this map:\n"
-        f"{discovery_text}\n"
-        f"Rejected doors already proven wrong for this task: {rejected_text}\n"
-        "Candidate doors:\n"
-        f"{chr(10).join(candidate_lines)}\n\n"
-        "Reply ONLY with JSON like "
-        '{"x": 12, "y": 8, "reason": "Likely Pokecenter location"}'
-    )
-
-    try:
-        response = client.messages.create(
-            model=HAIKU,
-            max_tokens=120,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception:
-        return None
-
-    raw_text = response.content[0].text.strip()
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}") + 1
-        if start == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(raw_text[start:end])
-        except json.JSONDecodeError:
-            return None
-
-    if not isinstance(parsed, dict):
-        return None
-    if "x" not in parsed or "y" not in parsed:
-        return None
-    try:
-        x = int(parsed["x"])
-        y = int(parsed["y"])
-    except (TypeError, ValueError):
-        return None
-
-    reason = str(parsed.get("reason", "")).strip()[:120]
-    return {"x": x, "y": y, "reason": reason}
-
-
-def select_route_exit(map_name: str,
-                      objective: str,
-                      player_pos: tuple[int, int],
-                      candidates: list[dict]) -> dict | None:
-    """Ask Claude to choose the most likely route exit for the current travel goal."""
-    if not candidates:
-        return None
-
-    candidate_lines = []
-    for idx, cand in enumerate(candidates, start=1):
-        candidate_lines.append(
-            f"{idx}. {cand['side']} exit centered at ({cand['x']},{cand['y']}) "
-            f"distance {cand['distance']} steps span {cand['span']}"
-        )
-
-    prompt = (
-        "You are helping an AI agent play Pokemon FireRed.\n"
-        f"Current outdoor map: {map_name}\n"
-        f"Current objective: {objective}\n"
-        f"Player position: ({player_pos[0]},{player_pos[1]})\n"
-        "Choose the most likely route/map exit based on the travel goal and your knowledge of FireRed map connections.\n"
-        "Distance is only a weak tiebreaker. Do NOT choose an exit mainly because it is closer if another exit better matches the objective.\n"
-        "Prefer the exit that best matches the intended destination or story progress, even if it is farther away.\n"
-        "Candidate exits:\n"
-        f"{chr(10).join(candidate_lines)}\n\n"
-        "Reply ONLY with JSON like "
-        '{"x": 25, "y": 33, "reason": "South exit leads back toward Pallet Town"}'
-    )
-
-    try:
-        response = client.messages.create(
-            model=HAIKU,
-            max_tokens=120,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception:
-        return None
-
-    raw_text = response.content[0].text.strip()
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}") + 1
-        if start == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(raw_text[start:end])
-        except json.JSONDecodeError:
-            return None
-
-    if not isinstance(parsed, dict) or "x" not in parsed or "y" not in parsed:
-        return None
-    try:
-        x = int(parsed["x"])
-        y = int(parsed["y"])
-    except (TypeError, ValueError):
-        return None
-
-    reason = str(parsed.get("reason", "")).strip()[:120]
-    return {"x": x, "y": y, "reason": reason}
-
-
-def classify_navigation_intent(map_name: str,
-                               current_objective: str,
-                               strategy_objective: str,
-                               indoor: bool,
-                               hp_ratio: float,
-                               party_count: int,
-                               visible_doors: int,
-                               visible_objects: int,
-                               visible_summary: str,
-                               current_state: str,
-                               previous_intent: str | None = None) -> dict | None:
-    """Ask Claude to choose the best high-level overworld navigation intent.
-
-    Returns {"intent": str, "reason": str} or None on failure.
+    Returns {"target": str, "reason": str, "display": str} or None on failure.
+    Target format: "door:X,Y", "npc:ID", or "edge:DIRECTION".
     """
     prompt = (
-        "You are helping an AI agent play Pokemon FireRed.\n"
-        "Choose the SINGLE best immediate overworld navigation intent.\n"
-        "Allowed intents: go_to_building, go_to_route_exit, talk_to_npc, interact_with_object, leave_building, train, none.\n\n"
-        f"Current map: {map_name}\n"
-        f"Map type: {'indoor' if indoor else 'outdoor'}\n"
-        f"Current objective: {current_objective or '(none)'}\n"
-        f"Strategy objective: {strategy_objective or '(none)'}\n"
-        f"Lead HP ratio: {hp_ratio:.2f}\n"
-        f"Party count: {party_count}\n"
-        f"Visible doors/exits on map: {visible_doors}\n"
-        f"Visible objects/NPCs on map: {visible_objects}\n"
-        f"Visible interactables summary: {visible_summary or 'none'}\n"
-        f"Current nav state: {current_state}\n"
-        f"Previous nav intent: {previous_intent or 'none'}\n\n"
-        "Rules:\n"
-        "- If the player has reached the destination area and now needs a local building or NPC, prefer go_to_building or talk_to_npc over go_to_route_exit.\n"
-        "- If the player has no Pokemon yet and there are nearby non-NPC interactables or trigger tiles, prefer interact_with_object over leaving.\n"
-        "- If the player is inside a Pokemon Center and still needs service from the counter/nurse, prefer talk_to_npc over leaving or wandering.\n"
-        "- If the player is inside a Mart and still needs to buy, sell, or receive a story item from the clerk, prefer talk_to_npc over leaving or wandering.\n"
-        "- Use interact_with_object when the best next step is to step onto or inspect a nearby trigger, item, sign, or other non-NPC interactable.\n"
-        "- Use leave_building when inside the wrong building or when the objective is to go outside.\n"
-        "- Use go_to_route_exit only when the best next step is leaving the current map.\n"
-        "- Use talk_to_npc when already in the correct building or standing at the relevant NPC/counter.\n"
-        "- Use train only when the objective is clearly about training or wild encounters.\n"
-        "- Use none if no structured intent clearly applies.\n\n"
-        'Reply ONLY with JSON like {"intent":"go_to_building","reason":"Need to find Oak\'s Lab in the current town."}'
+        f"CURRENT PROGRESS: {progress_summary}\n\n"
+        f"{exploration_summary}\n\n"
+        "Pick the best target to navigate to."
     )
 
     try:
         response = client.messages.create(
             model=HAIKU,
-            max_tokens=120,
-            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            system=[{
+                "type": "text",
+                "text": NAV_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": '{"target": "'},
+            ],
         )
     except Exception:
         return None
 
-    raw_text = response.content[0].text.strip()
+    raw_text = '{"target": "' + response.content[0].text.strip()
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
@@ -298,141 +140,26 @@ def classify_navigation_intent(map_name: str,
         except json.JSONDecodeError:
             return None
 
-    if not isinstance(parsed, dict):
+    if not isinstance(parsed, dict) or "target" not in parsed:
         return None
-    intent = str(parsed.get("intent", "")).strip()
-    if intent not in {"go_to_building", "go_to_route_exit", "talk_to_npc", "interact_with_object", "leave_building", "train", "none"}:
+
+    target = str(parsed["target"]).strip()
+    # Validate target format
+    if not (target.startswith("door:") or target.startswith("npc:") or target.startswith("edge:")):
         return None
+
     reason = str(parsed.get("reason", "")).strip()[:120]
-    return {"intent": intent, "reason": reason}
+    display = str(parsed.get("display", reason)).strip()[:80]
 
+    usage_info = {
+        "model": HAIKU,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "cache_read": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
+        "cache_creation": getattr(response.usage, "cache_creation_input_tokens", 0) or 0,
+    }
 
-def select_npc_target(map_name: str,
-                      current_objective: str,
-                      strategy_objective: str,
-                      player_pos: tuple[int, int],
-                      candidates: list[dict]) -> dict | None:
-    """Ask Claude to choose the most relevant visible NPC/object target."""
-    if not candidates:
-        return None
-
-    candidate_lines = []
-    for idx, cand in enumerate(candidates, start=1):
-        candidate_lines.append(
-            f"{idx}. id={cand['local_id']} label={cand['label']} at ({cand['x']},{cand['y']}) "
-            f"distance {cand['distance']} talked {cand.get('interaction_count', 0)}x"
-        )
-
-    prompt = (
-        "You are helping an AI agent play Pokemon FireRed.\n"
-        "Choose the SINGLE most relevant visible NPC or interactable for the current local objective.\n"
-        f"Current map: {map_name}\n"
-        f"Current objective: {current_objective or '(none)'}\n"
-        f"Strategy objective: {strategy_objective or '(none)'}\n"
-        f"Player position: ({player_pos[0]},{player_pos[1]})\n"
-        "Visible candidates:\n"
-        f"{chr(10).join(candidate_lines)}\n\n"
-        "Rules:\n"
-        "- Prefer the NPC most likely to advance the stated objective.\n"
-        "- If one NPC has already been talked to many times without progress, prefer a different plausible NPC.\n"
-        "- If the objective is to talk to a key story character, choose the candidate most likely to be that character.\n\n"
-        'Reply ONLY with JSON like {"local_id": 3, "reason": "Most likely to be Professor Oak."}'
-    )
-
-    try:
-        response = client.messages.create(
-            model=HAIKU,
-            max_tokens=120,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception:
-        return None
-
-    raw_text = response.content[0].text.strip()
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}") + 1
-        if start == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(raw_text[start:end])
-        except json.JSONDecodeError:
-            return None
-
-    if not isinstance(parsed, dict) or "local_id" not in parsed:
-        return None
-    try:
-        local_id = int(parsed["local_id"])
-    except (TypeError, ValueError):
-        return None
-    reason = str(parsed.get("reason", "")).strip()[:120]
-    return {"local_id": local_id, "reason": reason}
-
-
-def select_interactable_target(map_name: str,
-                               current_objective: str,
-                               strategy_objective: str,
-                               party_count: int,
-                               player_pos: tuple[int, int],
-                               candidates: list[dict]) -> dict | None:
-    """Ask Claude to choose the most relevant non-NPC interactable target."""
-    if not candidates:
-        return None
-
-    candidate_lines = []
-    for idx, cand in enumerate(candidates, start=1):
-        candidate_lines.append(
-            f"{idx}. id={cand['id']} label={cand['label']} at ({cand['x']},{cand['y']}) "
-            f"distance {cand['distance']} interacted {cand.get('interaction_count', 0)}x"
-        )
-
-    prompt = (
-        "You are helping an AI agent play Pokemon FireRed.\n"
-        "Choose the SINGLE most relevant visible non-NPC interactable for the current objective.\n"
-        f"Current map: {map_name}\n"
-        f"Current objective: {current_objective or '(none)'}\n"
-        f"Strategy objective: {strategy_objective or '(none)'}\n"
-        f"Party count: {party_count}\n"
-        f"Player position: ({player_pos[0]},{player_pos[1]})\n"
-        "Visible candidates:\n"
-        f"{chr(10).join(candidate_lines)}\n\n"
-        "Rules:\n"
-        "- Prefer triggers, items, or other interactables most likely to advance the current objective.\n"
-        "- If one candidate has already been interacted with many times without progress, prefer a different plausible candidate.\n"
-        "- Walk-on triggers are often important story/event tiles.\n\n"
-        "- If the party is empty, prefer the trigger or item choice most likely to start the required starter/progression event.\n\n"
-        "- If the party is empty and a visible Pokeball/item object is present, prefer the actual object over nearby trigger tiles.\n\n"
-        'Reply ONLY with JSON like {"id":"obj:7","reason":"This trigger likely starts the required event."}'
-    )
-
-    try:
-        response = client.messages.create(
-            model=HAIKU,
-            max_tokens=120,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception:
-        return None
-
-    raw_text = response.content[0].text.strip()
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        start = raw_text.find("{")
-        end = raw_text.rfind("}") + 1
-        if start == -1 or end <= start:
-            return None
-        try:
-            parsed = json.loads(raw_text[start:end])
-        except json.JSONDecodeError:
-            return None
-
-    if not isinstance(parsed, dict) or "id" not in parsed:
-        return None
-    reason = str(parsed.get("reason", "")).strip()[:120]
-    return {"id": str(parsed["id"]).strip(), "reason": reason}
+    return {"target": target, "reason": reason, "display": display, "usage": usage_info}
 
 
 def image_to_base64(img: Image.Image) -> str:
@@ -467,26 +194,11 @@ def _strip_coordinates(text: str) -> str:
 
 def build_messages(game_state: dict,
                    recent_actions: list[dict], progress_summary: str,
-                   stuck_warning: str | None = None,
                    exploration_summary: str | None = None) -> list[dict]:
-    """Build the messages array for the API call (no screenshot)."""
-    # Section 1: Recent actions (strategy context only, no coordinates)
+    """Build the messages array for the API call (battle/bag/menu states)."""
     parts = []
-    gstate_early = game_state.get("game_state", "overworld")
-    if recent_actions and gstate_early == "overworld":
-        history = "\n".join(
-            f"  {a['action']} — {_strip_coordinates(a['reason'])}"
-            for a in recent_actions[-3:]
-        )
-        parts.append(f"RECENT ACTIONS (last {len(recent_actions[-3:])}):\n{history}")
 
     parts.append(f"CURRENT PROGRESS: {progress_summary}")
-
-    if exploration_summary:
-        parts.append(exploration_summary)
-
-    if stuck_warning:
-        parts.append(f"WARNING: {stuck_warning}")
 
     # Section 2: Current state — context depends on game_state
     gs = game_state
@@ -645,21 +357,11 @@ def build_messages(game_state: dict,
 
 
 def get_action(game_state: dict,
-               recent_actions: list[dict], progress_summary: str,
-               stuck_warning: str | None = None,
-               force_sonnet: bool = False,
-               exploration_summary: str | None = None) -> tuple[dict, dict]:
-    """Call Claude and return (parsed_action, usage_info).
+               recent_actions: list[dict], progress_summary: str) -> tuple[dict, dict]:
+    """Call Claude for battle/bag/menu actions. Returns (parsed_action, usage_info)."""
+    model = HAIKU
 
-    Returns:
-        parsed_action: {"action": str, "reason": str}
-        usage_info: {"model": str, "input_tokens": int, "output_tokens": int}
-    """
-    model = SONNET if force_sonnet else HAIKU
-
-    messages = build_messages(game_state, recent_actions,
-                              progress_summary, stuck_warning,
-                              exploration_summary)
+    messages = build_messages(game_state, recent_actions, progress_summary)
 
     # Add assistant prefill for Haiku — force JSON output
     if "haiku" in model:

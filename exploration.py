@@ -396,172 +396,82 @@ class ExplorationTracker:
         interactions = self.maps[map_id].get("interactions", {})
         return interactions.get(str(local_id), 0)
 
-    def _tile_description(self, tile_char: str, x: int, y: int,
-                          visited: dict, is_outdoor: bool) -> str:
-        """Describe a tile in plain text."""
-        visit_count = visited.get((x, y), 0)
-        visit_str = f" (visited {visit_count}x)" if visit_count > 0 else " (unvisited)"
-
-        if tile_char == "1":
-            return "wall"
-        elif tile_char == "G":
-            return "tall grass" + visit_str
-        elif tile_char == "S":
-            return "stairs" + visit_str
-        elif tile_char == "D":
-            label = "building entrance" if is_outdoor else "door/stairs"
-            return label + visit_str
-        elif tile_char == "0":
-            return "walkable" + visit_str
-        else:
-            return "walkable" + visit_str
-
     def get_summary(self, map_id: int, map_name: str,
                     player_x: int = None, player_y: int = None,
                     collision_grid: tuple[int, int, list[str]] = None,
                     objects: list[dict] = None,
-                    bg_events: list[dict] = None) -> str:
-        """Generate pre-computed exploration summary.
+                    bg_events: list[dict] = None,
+                    world_knowledge=None) -> str:
+        """Generate exploration summary showing discovered doors/exits and NPCs.
 
-        Instead of an ASCII grid, returns plain text describing:
-        - Adjacent tiles (Up/Down/Left/Right)
-        - Nearby doors/stairs
-        - Unvisited tile count and direction
-        - Overvisited tile warnings
+        Uses world_knowledge to label doors and NPCs as known or unknown.
         """
-        self._ensure_map(map_id)
-        data = self.maps[map_id]
-        visits = data["visits"]
-
         if player_x is None or player_y is None:
             return ""
 
-        # Parse visited coordinates
-        visited = {}
-        for key, count in visits.items():
-            x, y = key.split(",")
-            visited[(int(x), int(y))] = count
-
-        # Detect outdoor map
         is_outdoor = any(tag in map_name.upper() for tag in
                          ["TOWN", "CITY", "ROUTE", "LAKE", "ISLAND"])
 
         lines = [f"MAP: {map_name} ({'outdoor' if is_outdoor else 'indoor'})"]
 
-        # Adjacent tiles
+        # --- NEARBY EXITS (doors/stairs + map edges) ---
+        exit_lines = []
+
         if collision_grid:
             grid_w, grid_h, grid_rows = collision_grid
-            directions = {
-                "Up": (player_x, player_y - 1),
-                "Down": (player_x, player_y + 1),
-                "Left": (player_x - 1, player_y),
-                "Right": (player_x + 1, player_y),
-            }
-            # Build object lookup by position for quick access
-            obj_at = {}
-            if objects:
-                for obj in objects:
-                    obj_at[(obj["x"], obj["y"])] = obj
 
-            # Build BG/coord event lookup by position
-            bg_at = {}
-            if bg_events:
-                for ev in bg_events:
-                    bg_at[(ev["x"], ev["y"])] = ev
-
-            adj_parts = []
-            interactions = self.maps[map_id].get("interactions", {})
-            for dir_name, (tx, ty) in directions.items():
-                if 0 <= tx < grid_w and 0 <= ty < grid_h:
-                    tile = grid_rows[ty][tx]
-                    obj_here = obj_at.get((tx, ty))
-                    bg_here = bg_at.get((tx, ty))
-                    if obj_here:
-                        icount = interactions.get(str(obj_here["local_id"]), 0)
-                        tag = f"talked {icount}x" if icount > 0 else "NOT yet interacted"
-                        desc = f"{obj_here['label']} [{tag}] (face {dir_name} and press A)"
-                    elif bg_here:
-                        if bg_here["type"] == "coord":
-                            desc = f"script trigger (walk onto this tile to activate)"
-                        else:
-                            desc = f"interactable {bg_here['label']} (face {dir_name} and press A)"
-                    else:
-                        desc = self._tile_description(tile, tx, ty, visited, is_outdoor)
-                    adj_parts.append(f"  {dir_name}: {desc}")
-                else:
-                    if is_outdoor:
-                        adj_parts.append(f"  {dir_name}: map edge (walk here to leave to next area)")
-                    else:
-                        adj_parts.append(f"  {dir_name}: wall (map boundary)")
-            lines.append("ADJACENT TILES:")
-            lines.extend(adj_parts)
-
-            # Find all doors/stairs on the map
-            doors = []
+            # Find all door/stair tiles on the map
             for gy in range(grid_h):
                 for gx in range(grid_w):
                     if grid_rows[gy][gx] in ("D", "S"):
                         dist = abs(gx - player_x) + abs(gy - player_y)
-                        label = "stairs" if grid_rows[gy][gx] == "S" else (
-                            "entrance" if is_outdoor else "door/stairs")
-                        doors.append((gx, gy, dist, label))
-            doors.sort(key=lambda d: d[2])
-            if doors:
-                door_strs = [f"({d[0]},{d[1]}) {d[3]} {d[2]} tiles away" for d in doors[:5]]
-                lines.append(f"DOORS/EXITS: {', '.join(door_strs)}")
+                        # Register in world knowledge so it appears as "unknown" if new
+                        if world_knowledge:
+                            world_knowledge.ensure_door(map_id, gx, gy)
+                            label = world_knowledge.get_door_label(map_id, gx, gy)
+                        else:
+                            label = "unknown"
+                        tile_type = "stairs" if grid_rows[gy][gx] == "S" else "door"
+                        # Direction hint from player
+                        dy = gy - player_y
+                        dx = gx - player_x
+                        dir_parts = []
+                        if dy < 0: dir_parts.append("north")
+                        if dy > 0: dir_parts.append("south")
+                        if dx < 0: dir_parts.append("west")
+                        if dx > 0: dir_parts.append("east")
+                        dir_str = "-".join(dir_parts) if dir_parts else "here"
+                        exit_lines.append((dist, f"  {tile_type} at ({gx},{gy}) -> {label} ({dist} tiles {dir_str})"))
 
-        # Objects (NPCs, items, Pokeballs) + BG events (script triggers, signs)
-        all_interactables = []
+        # Map edge connections
+        if world_knowledge:
+            edges = world_knowledge.get_map_edges(map_id)
+            for edge in edges:
+                exit_lines.append((0, f"  {edge['direction']} edge -> {edge['label']}"))
+
+        if exit_lines:
+            exit_lines.sort(key=lambda x: x[0])
+            lines.append("NEARBY EXITS:")
+            lines.extend(desc for _, desc in exit_lines[:8])
+
+        # --- NEARBY NPCs ---
+        npc_lines = []
         if objects:
-            interactions = self.maps[map_id].get("interactions", {})
             for obj in objects:
                 dist = abs(obj["x"] - player_x) + abs(obj["y"] - player_y)
-                icount = interactions.get(str(obj["local_id"]), 0)
-                tag = f" [talked {icount}x]" if icount > 0 else " [NOT yet interacted]"
-                all_interactables.append((dist, f"({obj['x']},{obj['y']}) {obj['label']} {dist} tiles away{tag}"))
-        if bg_events:
-            for ev in bg_events:
-                dist = abs(ev["x"] - player_x) + abs(ev["y"] - player_y)
-                if ev["type"] == "coord":
-                    all_interactables.append((dist, f"({ev['x']},{ev['y']}) walk-on trigger {dist} tiles away"))
+                local_id = obj["local_id"]
+                if world_knowledge:
+                    npc_info = world_knowledge.get_npc_label(map_id, local_id)
                 else:
-                    all_interactables.append((dist, f"({ev['x']},{ev['y']}) {ev['label']} {dist} tiles away"))
-        if all_interactables:
-            all_interactables.sort(key=lambda x: x[0])
-            lines.append(f"OBJECTS: {', '.join(s for _, s in all_interactables[:8])}")
+                    npc_info = None
+                if npc_info:
+                    npc_lines.append((dist, local_id, f"  ({obj['x']},{obj['y']}) NPC #{local_id} — {npc_info} ({dist} tiles away)"))
+                else:
+                    npc_lines.append((dist, local_id, f"  ({obj['x']},{obj['y']}) NPC #{local_id} — unknown ({dist} tiles away)"))
 
-        if collision_grid:
-            # Count unvisited walkable tiles and find nearest direction
-            unvisited = []
-            for gy in range(grid_h):
-                for gx in range(grid_w):
-                    if is_passable(grid_rows[gy][gx]) and (gx, gy) not in visited:
-                        unvisited.append((gx, gy))
-
-            if unvisited:
-                # Find general direction to nearest cluster of unvisited
-                nearest = min(unvisited, key=lambda p: abs(p[0] - player_x) + abs(p[1] - player_y))
-                dx = nearest[0] - player_x
-                dy = nearest[1] - player_y
-                dir_hints = []
-                if dy < 0: dir_hints.append("north")
-                if dy > 0: dir_hints.append("south")
-                if dx < 0: dir_hints.append("west")
-                if dx > 0: dir_hints.append("east")
-                dir_str = "-".join(dir_hints) if dir_hints else "here"
-                lines.append(f"UNEXPLORED: {len(unvisited)} tiles, nearest to the {dir_str}")
-            else:
-                lines.append("UNEXPLORED: none — map fully explored")
-
-        # Current tile visit count
-        current_visits = visited.get((player_x, player_y), 0)
-        lines.append(f"CURRENT TILE: visited {current_visits}x")
-
-        # Overvisited warning
-        sorted_visits = sorted(visited.items(), key=lambda x: x[1], reverse=True)
-        top_overvisited = [(k, v) for k, v in sorted_visits if v >= 5][:3]
-        if top_overvisited:
-            ov = ", ".join(f"({k[0]},{k[1]})={v}x" for k, v in top_overvisited)
-            lines.append(f"OVERVISITED: {ov} — avoid these tiles!")
+        if npc_lines:
+            npc_lines.sort(key=lambda x: x[0])
+            lines.append("NEARBY NPCs:")
+            lines.extend(desc for _, _, desc in npc_lines[:8])
 
         return "\n".join(lines)

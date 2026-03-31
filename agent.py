@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import random
 import threading
 import time
 import sqlite3
@@ -15,11 +14,11 @@ import websockets
 load_dotenv()
 
 import signal
-from emulator import press_button, read_game_state, test_connection, get_collision_grid, get_objects, get_bg_events, get_map_connections
-from claude_client import get_action, HAIKU, SONNET, _strip_coordinates
-from anti_stuck import AntiStuck
-from exploration import ExplorationTracker, bfs_path_hint, bfs_to_unvisited
-from navigation import NavContext, WorldSnapshot, decide_nav_action
+from emulator import press_button, read_game_state, test_connection, get_collision_grid, get_objects, get_map_connections
+from claude_client import get_action, get_navigation_target, HAIKU, SONNET
+from exploration import ExplorationTracker
+from navigation import PathState, plan_path_to_target, get_arrival_action
+from world_knowledge import WorldKnowledge
 from progress import (load_progress, save_progress, update_progress,
                       get_summary_line, rethink_objective,
                       check_tier1_update, check_tier2_update,
@@ -374,9 +373,9 @@ def main():
     print(f"Overlay server running on ws://localhost:{WS_PORT}")
 
     conn = init_db()
-    anti_stuck = AntiStuck()
     explorer = ExplorationTracker()
-    navigator = NavContext()
+    knowledge = WorldKnowledge()
+    path_state = PathState()
     naming = NamingContext()
     progress = load_progress()
     recent_actions: list[dict] = []
@@ -385,9 +384,8 @@ def main():
     last_hourly_report = time.time()
     last_map_id = None
     last_game_state_str = None
-    active_path_hint = None  # BFS hint string, persists across ticks
-    path_hint_ttl = 0        # ticks remaining to show the hint
-    overworld_actions = 0    # counts overworld actions for autopilot trigger
+    last_pos: tuple[int, int] | None = None  # for door-learning on map transitions
+    last_tile_type: str | None = None         # "D"/"S"/None at last position
     hourly_summaries: list[dict] = []  # last 4 hourly summaries for overlay
     shutting_down = False
 
@@ -448,75 +446,59 @@ def main():
             py = game_state.get("player_y", 0)
             explorer.record_visit(map_id, px, py)
 
-            # Detect walls: if last action was a direction and position didn't change
-            if recent_actions and not naming_ui_active:
-                last_btn = recent_actions[-1]["action"]
-                if last_btn in ("Up", "Down", "Left", "Right"):
-                    last_x = recent_actions[-1].get("px", px)
-                    last_y = recent_actions[-1].get("py", py)
-                    if px == last_x and py == last_y:
-                        explorer.record_wall(map_id, last_x, last_y, last_btn)
+            # --- World knowledge: learn from map transitions ---
+            map_changed = (map_id != last_map_id) and last_map_id is not None
+            map_name = game_state.get("map_name", "UNKNOWN")
 
-            # Position-based stuck detection (replaces frame diffing) — overworld only
-            stuck_warning_frame = None
-            blocked_dir = None
-            is_in_battle = game_state.get("in_battle", False)
-            if recent_actions and not is_in_battle and not naming_ui_active:
-                last_action = recent_actions[-1]["action"]
-                if last_action in ("Up", "Down", "Left", "Right"):
-                    last_x = recent_actions[-1].get("px", px)
-                    last_y = recent_actions[-1].get("py", py)
-                    if px == last_x and py == last_y:
-                        blocked_dir = last_action  # triggers new BFS hint
-                        stuck_warning_frame = f"Your last action ({last_action}) had no effect — you hit a wall. Pick a DIFFERENT direction."
-                        print(f"  [!] POSITION UNCHANGED — '{last_action}' hit a wall")
+            if map_changed:
+                # If we walked through a door/stairs, label it with destination
+                if last_tile_type in ("D", "S") and last_pos is not None:
+                    knowledge.learn_door(last_map_id, last_pos[0], last_pos[1], map_name)
+                    print(f"  [knowledge] Door at map {last_map_id} ({last_pos[0]},{last_pos[1]}) -> {map_name}")
+                # Learn map edge connections for the new map
+                map_connections = get_map_connections(map_id)
+                knowledge.learn_map_edges(map_id, map_connections)
+                # Clear path on map change — need to re-plan
+                path_state.clear()
 
-            # 3. Check for stuck conditions
-            if naming_ui_active:
-                stuck_warning, _force_sonnet = None, False
-            else:
-                stuck_warning, _force_sonnet = anti_stuck.check(
-                    recent_actions, game_state, action_count
-                )
-            force_sonnet = False  # Haiku only for gameplay; Sonnet used only for objectives
-            if stuck_warning:
-                print(f"  [!] STUCK: {stuck_warning}")
+            # Track current tile type for door learning
+            current_tile_type = None
+            collision = None
+            if not game_state.get("in_battle", False):
+                collision = get_collision_grid(map_id)
+                if collision:
+                    grid_w, grid_h, grid_rows = collision
+                    if 0 <= px < grid_w and 0 <= py < grid_h:
+                        current_tile_type = grid_rows[py][px]
 
-            # Combine warnings
-            all_warnings = "\n".join(w for w in [stuck_warning, stuck_warning_frame] if w) or None
+            last_pos = (px, py)
+            last_tile_type = current_tile_type
+            last_map_id = map_id
 
-            # 4. Update progress
+            # 3. Update progress
             progress = update_progress(progress, game_state, action_count)
             progress_summary = get_summary_line(progress)
 
-            # 4a. Tiered objective updates
-            map_changed = (map_id != last_map_id) and last_map_id is not None
+            # 3a. Tiered objective updates
             current_game_state_str = game_state.get("game_state", "unknown")
             state_changed = (current_game_state_str != last_game_state_str) and last_game_state_str is not None
 
-            # Track battle entry/exit using game_state_str (not in_battle, which fires during transition)
             entered_battle = current_game_state_str == "battle" and last_game_state_str != "battle"
             exited_battle = current_game_state_str == "overworld" and last_game_state_str not in ("overworld", None)
 
-            last_map_id = map_id
             if state_changed:
                 print(f"  [state change] {last_game_state_str} -> {current_game_state_str}")
             last_game_state_str = current_game_state_str
 
-            # Tier 1: Updates only when badge count changes
             check_tier1_update(progress, game_state)
 
-            # Tier 2: Updates every 50 actions or battle enter/exit.
-            # Do not force a refresh on ordinary map changes, or the strategy can
-            # thrash between neighboring maps (e.g. Route 1 <-> Viridian City).
             in_battle_now = current_game_state_str == "battle"
             planner_state = dict(game_state)
             planner_state["_progress_context"] = progress
             if entered_battle or exited_battle:
-                progress["tier2_last_action"] = action_count - 50  # guarantee trigger
+                progress["tier2_last_action"] = action_count - 50
             check_tier2_update(progress, planner_state, action_count, in_battle=in_battle_now)
 
-            # Tier 3: Updates every 25 actions (10 in battle), on map change, or battle enter/exit
             periodic_interval = 10 if in_battle_now else 25
             needs_objective = map_changed or entered_battle or exited_battle or (action_count > 0 and action_count % periodic_interval == 0)
             if needs_objective:
@@ -530,50 +512,27 @@ def main():
                 except Exception as e:
                     print(f"  [tier3] Failed: {e}")
 
-            # 4b. Get collision grid, objects, bg events, and exploration summary
-            # Skip expensive overworld data when in battle/bag/pokemon menus
+            # 4. Gather overworld data
             is_overworld = current_game_state_str == "overworld"
-            map_name = game_state.get("map_name", "UNKNOWN")
-            collision = None
             objects = None
             player_facing = None
-            bg_events = []
-            map_connections = []
             exploration_summary = None
-            nav_action = None
             naming_action = None
 
             if is_overworld:
-                collision = get_collision_grid(map_id)
+                if not collision:
+                    collision = get_collision_grid(map_id)
                 objects, player_facing = get_objects(game_state)
-                if objects:
-                    for obj in objects:
-                        obj["interaction_count"] = explorer.get_interaction_count(map_id, obj["local_id"])
-                bg_events = get_bg_events(map_id)
-                map_connections = get_map_connections(map_id)
-                exploration_summary = explorer.get_summary(map_id, map_name, px, py, collision, objects, bg_events) or None
+                # Learn map edges on first visit
+                if not knowledge.get_map_edges(map_id):
+                    map_connections = get_map_connections(map_id)
+                    knowledge.learn_map_edges(map_id, map_connections)
+                exploration_summary = explorer.get_summary(
+                    map_id, map_name, px, py, collision, objects,
+                    world_knowledge=knowledge,
+                ) or None
                 if exploration_summary:
                     print(f"  [explore]\n{exploration_summary}")
-                world = WorldSnapshot(
-                    game_state=current_game_state_str,
-                    map_id=map_id,
-                    map_name=map_name,
-                    player_x=px,
-                    player_y=py,
-                    in_battle=game_state.get("in_battle", False),
-                    in_dialogue=game_state.get("in_dialogue", False),
-                    collision=collision,
-                    objects=objects,
-                    bg_events=bg_events,
-                    connections=map_connections,
-                    player_facing=player_facing,
-                    current_objective=progress.get("current_objective", ""),
-                    strategy_objective=progress.get("tier2_objective", ""),
-                    party=game_state.get("party", []),
-                )
-                nav_action = decide_nav_action(navigator, world)
-                if nav_action:
-                    print(f"  [nav] {navigator.state}: {nav_action['reason']}")
             else:
                 print(f"  [skip] Skipping map/object data (state={current_game_state_str})")
 
@@ -581,176 +540,98 @@ def main():
             if naming_action:
                 print(f"  [naming] {naming_action['reason']}")
 
-            # 4b2. Autopilot — every 50 overworld actions, BFS toward unvisited tile
-            if is_overworld:
-                overworld_actions += 1
-            if is_overworld and collision and not nav_action and overworld_actions % 50 == 0 and overworld_actions > 0:
-                # Build visited set from exploration data
-                visit_data = explorer.maps.get(map_id, {}).get("visits", {})
-                visited_set = set()
-                for key in visit_data:
-                    vx, vy = key.split(",")
-                    visited_set.add((int(vx), int(vy)))
+            # Clear path if battle started or we left overworld
+            if entered_battle or (not is_overworld and path_state.active):
+                path_state.clear()
 
-                path_steps = bfs_to_unvisited(collision, px, py, visited_set)
-                if path_steps:
-                    print(f"  [autopilot] Navigating {len(path_steps)} steps toward unvisited tile")
-                    for i, direction in enumerate(path_steps):
-                        try:
-                            press_button(direction)
-                            explorer.record_visit(map_id, px, py)
-                            action_count += 1
-                            recent_actions.append({"action": direction, "reason": "autopilot", "px": px, "py": py})
-                            if len(recent_actions) > 50:
-                                recent_actions = recent_actions[-50:]
-                            print(f"  [autopilot] Step {i+1}/{len(path_steps)}: {direction}")
-                        except (TimeoutError, ConnectionError, OSError):
-                            print(f"  [autopilot] Button press failed, aborting")
-                            break
-                        # Check if battle started — bail out
-                        time.sleep(1)
-                        try:
-                            check_state = read_game_state()
-                            px = check_state.get("player_x", px)
-                            py = check_state.get("player_y", py)
-                            if check_state.get("in_battle", False):
-                                print(f"  [autopilot] Battle triggered, handing back to LLM")
-                                break
-                        except (TimeoutError, ConnectionError, OSError, ValueError):
-                            break
-                    print(f"  [autopilot] Done, resuming LLM control")
-                    continue
-                else:
-                    print(f"  [autopilot] No unvisited tiles reachable, skipping")
+            # 5. Choose next action
+            NO_COST = {"model": "nav-state", "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_creation": 0}
 
-            # 4c. Hint if player is standing on a door/warp tile
-            if collision:
-                grid_w, grid_h, grid_rows = collision
-                if 0 <= py < grid_h and 0 <= px < grid_w and grid_rows[py][px] in ("D", "S"):
-                    door_hint = "You are standing ON a door/warp tile (D). You must walk the correct direction to pass through it. Try all directions (Up, Down, Left, Right) while on this tile until one works."
-                    all_warnings = "\n".join(w for w in [all_warnings, door_hint] if w)
-                    print(f"  [hint] Player on door tile at ({px},{py})")
-
-            # 4d. BFS path hint — recompute on new wall hit, persist for 5 ticks
-            if blocked_dir and collision:
-                hint = bfs_path_hint(collision, px, py, blocked_dir)
-                if hint:
-                    active_path_hint = hint
-                    path_hint_ttl = 5
-            if active_path_hint and path_hint_ttl > 0:
-                all_warnings = "\n".join(w for w in [all_warnings, active_path_hint] if w)
-                path_hint_ttl -= 1
-                print(f"  [hint] {active_path_hint} (ttl={path_hint_ttl})")
-            else:
-                active_path_hint = None
-
-            # 5. Choose next action.
-            # Dialogue advancement is deterministic: if the game says dialogue is active,
-            # advance it before asking either the nav layer or the LLM for movement.
             battle_menu_action = _get_battle_menu_action(game_state)
             if battle_menu_action:
                 action = battle_menu_action
-                usage = {
-                    "model": "nav-state",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_creation": 0,
-                }
+                usage = NO_COST
             elif (
                 game_state.get("game_state") == "unknown"
                 and not game_state.get("in_battle", False)
                 and not game_state.get("in_dialogue", False)
                 and "POKECENTER" in game_state.get("map_name", "")
             ):
-                action = {
-                    "action": "B",
-                    "reason": "Structured menu escape: unknown non-dialogue UI in a Pokemon Center, backing out with B",
-                    "display": "Backing out of an unknown Pokemon Center menu.",
-                }
-                usage = {
-                    "model": "nav-state",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_creation": 0,
-                }
+                action = {"action": "B", "reason": "Backing out of unknown Pokemon Center menu", "display": "Backing out of menu."}
+                usage = NO_COST
             elif naming_action:
                 action = naming_action
-                usage = {
-                    "model": "nav-state",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_creation": 0,
-                }
-            elif anti_stuck.in_random_recovery() and is_overworld:
-                anti_stuck.consume_random_recovery_turn()
-                button = random.choice(["Up", "Down", "Left", "Right"])
-                remaining = anti_stuck.random_recovery_remaining
-                action = {
-                    "action": button,
-                    "reason": (
-                        "Structured stuck recovery: no tile movement for 5 turns, "
-                        f"taking a random movement action ({remaining} recovery turns remain after this one)"
-                    ),
-                    "display": "Random recovery movement.",
-                }
-                usage = {
-                    "model": "nav-state",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_creation": 0,
-                }
+                usage = NO_COST
             elif game_state.get("in_dialogue", False) and not game_state.get("in_battle", False):
-                action = {
-                    "action": "A",
-                    "reason": "Structured dialogue: advance active dialogue before taking any movement action",
-                    "display": "Advancing dialogue.",
-                }
-                usage = {
-                    "model": "nav-state",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_creation": 0,
-                }
-            elif nav_action:
-                action = nav_action
-                usage = {
-                    "model": "nav-state",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read": 0,
-                    "cache_creation": 0,
-                }
-            else:
-                action, usage = get_action(
-                    game_state=game_state,
-                    recent_actions=recent_actions,
-                    progress_summary=progress_summary,
-                    stuck_warning=all_warnings,
-                    force_sonnet=force_sonnet,
-                    exploration_summary=exploration_summary,
-                )
+                action = {"action": "A", "reason": "Advance dialogue", "display": "Advancing dialogue."}
+                usage = NO_COST
+                # Learn NPC info from dialogue
+                if path_state.target_type == "npc" and path_state.target_npc_id is not None:
+                    dialogue_text = game_state.get("dialogue_text", "")
+                    if dialogue_text:
+                        knowledge.learn_npc(map_id, path_state.target_npc_id, map_name, dialogue_text)
+                        print(f"  [knowledge] NPC #{path_state.target_npc_id}: \"{dialogue_text[:60]}\"")
+            elif is_overworld and collision:
+                # --- Path-based navigation ---
+                # Check if path is stalled (position unchanged for several steps)
+                if path_state.active:
+                    if path_state.last_pos == (px, py):
+                        path_state.stalled_steps += 1
+                    else:
+                        path_state.stalled_steps = 0
+                    path_state.last_pos = (px, py)
+                    # If stalled for 3+ steps, clear path and re-plan
+                    if path_state.stalled_steps >= 3:
+                        print(f"  [path] Stalled for {path_state.stalled_steps} steps, re-planning")
+                        path_state.clear()
 
-            # 6. Press the button (prevent undoing last directional move, except in dialogue/battle)
+                # If no active path, ask LLM for a target
+                if not path_state.active and exploration_summary:
+                    nav_result = get_navigation_target(exploration_summary, progress_summary)
+                    if nav_result:
+                        planned = plan_path_to_target(
+                            nav_result["target"], collision, px, py, objects
+                        )
+                        if planned:
+                            planned.reason = nav_result["reason"]
+                            planned.display = nav_result["display"]
+                            path_state.target_type = planned.target_type
+                            path_state.target_id = planned.target_id
+                            path_state.target_pos = planned.target_pos
+                            path_state.target_npc_id = planned.target_npc_id
+                            path_state.path = planned.path
+                            path_state.reason = planned.reason
+                            path_state.display = planned.display
+                            path_state.stalled_steps = 0
+                            path_state.last_pos = (px, py)
+                            print(f"  [path] Target: {nav_result['target']} ({nav_result['reason']}) — {len(planned.path)} steps")
+                        else:
+                            print(f"  [path] No path found to {nav_result['target']}")
+
+                # Execute path or arrival action
+                if path_state.active and path_state.path:
+                    step = path_state.path.pop(0)
+                    action = {"action": step, "reason": f"Pathfinding to {path_state.target_id}: {path_state.reason}", "display": path_state.display}
+                    usage = NO_COST
+                elif path_state.active and not path_state.path:
+                    # Arrived at target
+                    arrival = get_arrival_action(path_state, px, py, collision)
+                    if arrival:
+                        action = {"action": arrival, "reason": f"Arrived at {path_state.target_id}: {path_state.reason}", "display": path_state.display}
+                    else:
+                        action = {"action": "A", "reason": f"Arrived at {path_state.target_id}", "display": path_state.display}
+                    usage = NO_COST
+                    path_state.clear()
+                else:
+                    # Fallback: no path planned, call LLM for battle/menu action
+                    action, usage = get_action(game_state, recent_actions, progress_summary)
+            else:
+                # Non-overworld (battle, bag, etc.) — call LLM
+                action, usage = get_action(game_state, recent_actions, progress_summary)
+
+            # 6. Press the button
             button = action.get("action", "A")
             reason = action.get("reason", "no reason given")
-            in_dialogue = game_state.get("in_dialogue", False)
-            in_battle = game_state.get("in_battle", False)
-            if usage["model"] != "nav-state" and not in_dialogue and not in_battle:
-                opposites = {"Left": "Right", "Right": "Left", "Up": "Down", "Down": "Up"}
-                if recent_actions and button in opposites:
-                    last_btn = recent_actions[-1]["action"]
-                    if opposites.get(last_btn) == button:
-                        # Pick a perpendicular direction instead
-                        perpendicular = {"Left": "Up", "Right": "Down", "Up": "Right", "Down": "Left"}
-                        new_btn = perpendicular[button]
-                        print(f"  [blocked] {button} would undo {last_btn}, redirecting to {new_btn}")
-                        reason = f"Blocked {button} (would undo {last_btn}), trying {new_btn}"
-                        button = new_btn
             try:
                 press_frames = 16
                 if naming_action or (game_state.get("in_dialogue", False) and not game_state.get("in_battle", False)):
@@ -761,78 +642,47 @@ def main():
                 time.sleep(5)
                 continue
 
-            # 6b. Interaction detection: if A was pressed, check if interaction happened
+            # 6b. NPC interaction detection
+            in_dialogue = game_state.get("in_dialogue", False)
             if button == "A" and objects and player_facing is not None:
-                # Determine faced tile based on player facing
-                # FireRed facing: 1=down, 2=up, 3=left, 4=right
                 facing_offsets = {1: (0, 1), 2: (0, -1), 3: (-1, 0), 4: (1, 0)}
                 dx, dy = facing_offsets.get(player_facing, (0, 0))
                 faced_x, faced_y = px + dx, py + dy
-
-                # Find object on the faced tile
                 faced_obj = None
                 for obj in objects:
                     if obj["x"] == faced_x and obj["y"] == faced_y:
                         faced_obj = obj
                         break
-
                 if faced_obj:
-                    # Check if interaction happened by reading new game state
                     try:
                         new_state = read_game_state()
                         new_dialogue = new_state.get("in_dialogue", False)
-                        # Dialogue started = interaction confirmed
                         if new_dialogue and not in_dialogue:
                             count = explorer.record_interaction(map_id, faced_obj["local_id"], faced_obj["label"])
-                            print(f"  [interact] Confirmed interaction with {faced_obj['label']} (id={faced_obj['local_id']}) — {count}x total")
-                        else:
-                            # Check if object vanished (item pickup)
-                            new_objects, _ = get_objects()
-                            if new_objects is not None:
-                                new_ids = {o["local_id"] for o in new_objects}
-                                if faced_obj["local_id"] not in new_ids:
-                                    count = explorer.record_interaction(map_id, faced_obj["local_id"], faced_obj["label"])
-                                    print(f"  [interact] Object {faced_obj['label']} (id={faced_obj['local_id']}) collected! — {count}x")
+                            dialogue_text = new_state.get("dialogue_text", "")
+                            knowledge.learn_npc(map_id, faced_obj["local_id"], map_name, dialogue_text)
+                            print(f"  [interact] Talked to {faced_obj['label']} (id={faced_obj['local_id']}) — {count}x total")
                     except (TimeoutError, ConnectionError, OSError, ValueError):
-                        pass  # don't break the loop for interaction tracking
+                        pass
 
             # 7. Calculate cost and log
             cost = calculate_cost(usage)
             log_action(conn, action, usage, cost, game_state,
                        progress_summary=progress_summary,
-                       exploration_summary=exploration_summary or "",
-                       warnings=all_warnings or "")
+                       exploration_summary=exploration_summary or "")
             action_count += 1
 
-
-            # 8. (objective now set by Sonnet every 25 actions, not by Haiku)
-
-            # 8b. Update recent actions (include position for wall detection)
+            # 8. Update recent actions
             recent_actions.append({"action": button, "reason": reason, "px": px, "py": py})
             if len(recent_actions) > 50:
                 recent_actions = recent_actions[-50:]
 
-            # 9. Fresh start every 240 actions (keep minimap data)
-            if action_count % 240 == 0 and action_count > 0:
-                print(f"  [reset] Action #{action_count} — wiping recent context for fresh start")
-                # Rethink tier 3 objective using Sonnet before clearing context
-                try:
-                    tier2 = progress.get("tier2_objective", "")
-                    planner_state = dict(game_state)
-                    planner_state["_progress_context"] = progress
-                    new_objective = rethink_objective(planner_state, tier2, in_battle=is_in_battle)
-                    progress["current_objective"] = new_objective
-                    print(f"  [rethink] New objective: {new_objective}")
-                except Exception as e:
-                    print(f"  [rethink] Failed: {e}")
-                    progress["current_objective"] = ""
-                recent_actions.clear()
-
-            # 9b. Save progress periodically
+            # 9. Periodic saves
             if action_count % SUMMARY_INTERVAL == 0:
                 save_progress(progress)
                 explorer.save()
-                print("  Progress and exploration data saved.")
+                knowledge.save()
+                print("  Progress, exploration, and knowledge saved.")
 
             # 10. Broadcast to overlay
             stats = get_session_stats(conn)
@@ -848,8 +698,8 @@ def main():
                 "objective": progress.get("current_objective", ""),
                 "tier1_objective": progress.get("tier1_objective", ""),
                 "tier2_objective": progress.get("tier2_objective", ""),
-                "nav_state": navigator.state.value,
-                "nav_intent": navigator.intent or "",
+                "nav_target": path_state.target_id or "",
+                "nav_path_len": len(path_state.path),
                 "player_x": game_state.get("player_x", 0),
                 "player_y": game_state.get("player_y", 0),
                 "map_name": game_state.get("map_name", ""),
@@ -868,13 +718,12 @@ def main():
             else:
                 model_short = "Haiku" if "haiku" in usage["model"] else "Sonnet"
             battle_str = " [BATTLE]" if game_state.get("in_battle") else ""
-            forced_str = " [FORCED]" if force_sonnet and "sonnet" in usage["model"] else ""
             safe_reason = reason.encode("ascii", errors="replace").decode("ascii")
             print(
                 f"[{action_count:>4}] {model_short:<6} | "
                 f"{button:<6} | {safe_reason:<50} | "
                 f"${cost:.4f} (total: ${stats['total_cost']:.4f})"
-                f"{battle_str}{forced_str}"
+                f"{battle_str}"
             )
 
             # 12. Hourly cost report + summary
@@ -904,6 +753,7 @@ def main():
         stats = get_session_stats(conn)
         save_progress(progress)
         explorer.save()
+        knowledge.save()
         print(f"\n\nStopped. Total actions: {action_count}, "
               f"Total cost: ${stats['total_cost']:.4f}")
         print("Progress saved to logs/progress.json")
