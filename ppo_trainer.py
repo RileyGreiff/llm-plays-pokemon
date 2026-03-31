@@ -16,9 +16,9 @@ class PPOTrainer:
     def __init__(
         self,
         policy: PokemonPolicy,
-        lr: float = 3e-4,
+        lr: float = 1e-4,
         clip_epsilon: float = 0.2,
-        entropy_coef: float = 0.05,
+        entropy_coef: float = 0.03,
         value_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         update_epochs: int = 4,

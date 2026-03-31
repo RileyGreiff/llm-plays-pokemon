@@ -25,6 +25,8 @@ import time
 def main():
     parser = argparse.ArgumentParser(description="Launch parallel RL training")
     parser.add_argument("--workers", type=int, default=4, help="Number of worker instances")
+    parser.add_argument("--threshold", type=int, default=512, help="Trainer PPO update threshold")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Trainer learning rate")
     args = parser.parse_args()
 
     python = sys.executable
@@ -46,7 +48,7 @@ def main():
 
     try:
         # Start trainer
-        trainer_cmd = [python, "rl_trainer.py"]
+        trainer_cmd = [python, "rl_trainer.py", "--update-threshold", str(args.threshold), "--lr", str(args.lr)]
         print(f"Starting trainer: {' '.join(trainer_cmd)}")
         trainer_proc = subprocess.Popen(trainer_cmd)
         processes.append(("Trainer", trainer_proc))

@@ -57,7 +57,7 @@ start "" "%~dp0BizHawk\\EmuHawk.exe"
 """
 
 
-def generate_training_bat(num_instances: int, threshold: int = 2048) -> str:
+def generate_training_bat(num_instances: int, threshold: int = 512, lr: float = 5e-5) -> str:
     """Generate a .bat file that launches all workers + trainer."""
     lines = [
         "@echo off",
@@ -69,7 +69,7 @@ def generate_training_bat(num_instances: int, threshold: int = 2048) -> str:
         "echo.",
         "",
         ":: Start the central trainer",
-        f'start "RL Trainer" cmd /k "venv\\Scripts\\activate.bat && python -u rl_trainer.py --update-threshold {threshold}"',
+        f'start "RL Trainer" cmd /k "venv\\Scripts\\activate.bat && python -u rl_trainer.py --update-threshold {threshold} --lr {lr}"',
         "timeout /t 2 /nobreak >NUL",
         "",
     ]
@@ -94,7 +94,8 @@ def generate_training_bat(num_instances: int, threshold: int = 2048) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Setup parallel RL training")
     parser.add_argument("--instances", type=int, default=2, help="Number of parallel instances")
-    parser.add_argument("--threshold", type=int, default=2048, help="PPO update step threshold")
+    parser.add_argument("--threshold", type=int, default=512, help="PPO update step threshold")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Trainer learning rate")
     args = parser.parse_args()
 
     n = args.instances
@@ -124,7 +125,7 @@ def main():
         print(f"  Created: start_bizhawk_{i}.bat")
 
     # Generate training launch script
-    training_bat = generate_training_bat(n, args.threshold)
+    training_bat = generate_training_bat(n, args.threshold, args.lr)
     bat_path = os.path.join(PROJECT_DIR, "start_training.bat")
     with open(bat_path, "w") as f:
         f.write(training_bat)

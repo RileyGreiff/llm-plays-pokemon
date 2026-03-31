@@ -6,7 +6,7 @@ RL policy handles navigation. Battles and dialogue are auto-advanced with A
 
 import time
 import emulator
-from state_encoder import encode_state
+from state_encoder import encode_navigation_state
 from reward_function import compute_reward, EpisodeTracker
 from replay_buffer import ReplayBuffer
 from pokemon_policy import PokemonPolicy, ACTION_MAP
@@ -40,6 +40,7 @@ def run_episode(
 
     # Read initial state
     state = emulator.read_game_state()
+    tracker.visited_maps.add(state.get("map_id", 0))
 
     if verbose:
         print(f"\n{'='*60}")
@@ -76,7 +77,7 @@ def run_episode(
         idle_steps = 0
 
         # RL policy handles navigation
-        state_tensor = encode_state(
+        state_tensor = encode_navigation_state(
             state, flag_id, step, flag.max_steps
         )
         action, log_prob, value = policy.act(state_tensor)

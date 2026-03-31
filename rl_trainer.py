@@ -30,8 +30,8 @@ POLL_INTERVAL = 5.0
 
 
 def run_trainer(
-    update_threshold: int = 2048,
-    lr: float = 3e-4,
+    update_threshold: int = 512,
+    lr: float = 5e-5,
     verbose: bool = True,
 ):
     """Main trainer loop — poll DB, run PPO when enough experience, save weights."""
@@ -44,7 +44,11 @@ def run_trainer(
     # Load existing weights
     if os.path.exists(POLICY_PATH):
         print("[Trainer] Loading existing policy weights...")
-        trainer.load(POLICY_PATH)
+        try:
+            trainer.load(POLICY_PATH)
+        except Exception as e:
+            print(f"[Trainer] WARNING: Could not load checkpoint: {e}")
+            print("[Trainer] Starting from fresh weights because the observation shape changed.")
 
     # Database
     db.init_db()
@@ -69,6 +73,9 @@ def run_trainer(
             # Read experience from DB
             ids, experiences = db.read_unconsumed_experience(conn, state_size, limit=update_threshold)
             if not experiences:
+                if ids:
+                    print(f"[Trainer] Discarding {len(ids)} stale experience rows with the wrong state size.")
+                    db.mark_consumed(conn, ids)
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -156,9 +163,9 @@ def _print_curriculum_status(conn):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Central RL Trainer")
-    parser.add_argument("--update-threshold", type=int, default=256,
-                        help="Min experience steps before PPO update (default 256)")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--update-threshold", type=int, default=512,
+                        help="Min experience steps before PPO update (default 512)")
+    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
     run_trainer(

@@ -142,10 +142,12 @@ def read_unconsumed_experience(
     experiences = []
     for row in cursor:
         exp_id, state_bytes, action, reward, value, log_prob, done = row
-        state = torch.from_numpy(
-            np.frombuffer(state_bytes, dtype=np.float32).copy()
-        )
         ids.append(exp_id)
+        state_arr = np.frombuffer(state_bytes, dtype=np.float32).copy()
+        if state_arr.size != state_size:
+            # Skip stale experience from an older observation schema.
+            continue
+        state = torch.from_numpy(state_arr)
         experiences.append({
             "state": state,
             "action": action,

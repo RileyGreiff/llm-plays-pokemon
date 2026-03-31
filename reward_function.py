@@ -16,6 +16,8 @@ class EpisodeTracker:
     total_map_tiles: dict = field(default_factory=dict)    # map_id -> tile count estimate
     talked_npcs: set = field(default_factory=set)          # (map_id, x, y) of NPCs already talked to
     visited_maps: set = field(default_factory=set)         # map_ids already entered
+    subgoal_rewards: set = field(default_factory=set)
+    rewarded_tiles: int = 0
     reward_total: float = 0.0
 
 
@@ -33,12 +35,12 @@ def efficiency_bonus(flag_id: str, steps_taken: int) -> float:
 
     if steps_taken < previous_best:
         improvement = (previous_best - steps_taken) / previous_best
-        bonus = 50.0 * improvement
+        bonus = 25.0 * improvement
         _best_steps[flag_id] = steps_taken
         return bonus
 
     if steps_taken > previous_best * 1.5:
-        return -20.0
+        return -10.0
 
     return 0.0
 
@@ -73,71 +75,58 @@ def compute_reward(
     # Flag completed
     if flag_check(after):
         bonus = efficiency_bonus(flag_id, tracker.steps)
-        return 100.0 + bonus, True
+        reward = _completion_reward(flag_id) + bonus
+        tracker.reward_total += reward
+        return reward, True
 
     # Player blacked out (all party fainted)
     if _player_blacked_out(after):
-        return -100.0, True
+        reward = -75.0
+        tracker.reward_total += reward
+        return reward, True
 
-    # Episode timeout — end episode but no extra penalty (step costs are enough)
+    # Timeout should be mildly bad so successful shorter runs dominate.
     if tracker.steps >= max_steps:
-        return 0.0, True
+        reward = -15.0
+        tracker.reward_total += reward
+        return reward, True
 
     # --- Step rewards ---
     reward = 0.0
 
-    # Step cost (always)
-    reward -= 0.01
-
-    # Wall bash — position didn't change despite moving
-    if _position_unchanged(before, after):
-        reward -= 0.1
+    # Step cost (always), kept small so transition tiles are not overwhelmed by revisit noise.
+    reward -= 0.005
 
     # New tile visited (decays with mastery)
     tile = (after.get("map_id", 0), after.get("player_x", 0), after.get("player_y", 0))
     if tile not in tracker.visited_tiles:
         tracker.visited_tiles.add(tile)
-        reward += 1.0 * (1.0 - mastery)
+        if tracker.rewarded_tiles < 40:
+            reward += _new_tile_reward(flag_id, mastery)
+            tracker.rewarded_tiles += 1
 
     # New map entered (first visit only)
     new_map_id = after.get("map_id", 0)
     if _entered_new_map(before, after) and new_map_id not in tracker.visited_maps:
         tracker.visited_maps.add(new_map_id)
-        reward += 25.0
+        reward += 5.0
 
         # Building entered (indoor maps — bank >= 4)
         if _entered_building(before, after):
-            reward += 25.0
+            reward += 3.0
 
     # NPC talked to (dialogue opened) — only reward first interaction per location
     if _started_dialogue(before, after):
         npc_tile = (before.get("map_id", 0), before.get("player_x", 0), before.get("player_y", 0))
         if npc_tile not in tracker.talked_npcs:
             tracker.talked_npcs.add(npc_tile)
-            reward += 3.0
+            reward += 1.0
 
     # Item picked up (party or inventory changed)
     if _picked_up_item(before, after):
-        reward += 5.0
+        reward += 10.0
 
-    # Map coverage milestones (25%, 50%, 75%)
-    current_map = after.get("map_id", 0)
-    tiles_on_map = sum(1 for t in tracker.visited_tiles if t[0] == current_map)
-    # Estimate map size — grows as we discover tiles
-    if current_map not in tracker.total_map_tiles:
-        tracker.total_map_tiles[current_map] = max(tiles_on_map, 20)
-    else:
-        tracker.total_map_tiles[current_map] = max(
-            tracker.total_map_tiles[current_map], tiles_on_map
-        )
-    estimated_size = tracker.total_map_tiles[current_map]
-    coverage = tiles_on_map / max(estimated_size, 1)
-
-    for milestone in [0.25, 0.50, 0.75]:
-        key = (current_map, milestone)
-        if coverage >= milestone and key not in tracker.coverage_milestones:
-            tracker.coverage_milestones.add(key)
-            reward += 5.0
+    reward += _subgoal_reward(flag_id, before, after, tracker)
 
     tracker.reward_total += reward
     return reward, False
@@ -190,6 +179,39 @@ def _player_blacked_out(state: dict) -> bool:
     if not party:
         return False
     return all(m.get("hp", 0) <= 0 for m in party)
+
+
+def _subgoal_reward(flag_id: str, before: dict, after: dict, tracker: EpisodeTracker) -> float:
+    """Small one-time shaping rewards for bottleneck transitions.
+
+    These should only help the agent discover the next meaningful phase of the
+    task, not replace the terminal reward.
+    """
+    reward = 0.0
+
+    if flag_id == "leave_house":
+        if (
+            before.get("map_name") != "PLAYERS_HOUSE_1F"
+            and after.get("map_name") == "PLAYERS_HOUSE_1F"
+            and "leave_house:reach_1f" not in tracker.subgoal_rewards
+        ):
+            tracker.subgoal_rewards.add("leave_house:reach_1f")
+            # Treat the first 2F -> 1F transition as the staircase milestone.
+            reward += 60.0
+
+    return reward
+
+
+def _completion_reward(flag_id: str) -> float:
+    if flag_id == "leave_house":
+        return 300.0
+    return 150.0
+
+
+def _new_tile_reward(flag_id: str, mastery: float) -> float:
+    if flag_id == "leave_house":
+        return 0.02 * (1.0 - mastery)
+    return 0.10 * (1.0 - mastery)
 
 
 def get_best_steps() -> dict[str, int]:

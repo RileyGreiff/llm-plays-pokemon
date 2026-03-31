@@ -15,13 +15,13 @@ import torch
 
 import emulator
 from pokemon_policy import PokemonPolicy, ACTION_MAP
-from state_encoder import encode_state, get_state_size
+from state_encoder import encode_navigation_state, get_state_size
 from reward_function import compute_reward, EpisodeTracker
 from story_flags import FLAG_BY_ID, FLAG_ORDER
 import rl_database as db
 
 # How often to reload policy weights from disk (seconds)
-WEIGHT_RELOAD_INTERVAL = 30.0
+WEIGHT_RELOAD_INTERVAL = 5.0
 
 # Paths
 SAVE_DIR = "rl_checkpoints"
@@ -77,6 +77,9 @@ def run_worker(worker_id: int, verbose: bool = True):
             if verbose:
                 print(f"\n[Worker {worker_id}] Episode {episode_num} | "
                       f"Flag: {flag.name} | Mastery: {mastery:.2f}")
+
+            # Always grab the freshest weights before each rollout.
+            _reload_weights(policy, worker_id)
 
             # Run episode and collect experience
             result, experiences = _run_episode_to_db(
@@ -164,7 +167,7 @@ def _run_episode_to_db(
         idle_steps = 0
 
         # RL policy
-        state_tensor = encode_state(state, flag_id, step, flag.max_steps)
+        state_tensor = encode_navigation_state(state, flag_id, step, flag.max_steps)
         action, log_prob, value = policy.act(state_tensor)
 
         button = ACTION_MAP[action]
@@ -179,9 +182,11 @@ def _run_episode_to_db(
         )
 
         experiences.append((step, state_tensor, action, reward, value, log_prob, done))
+        # Attribute the reward to the tile the agent stepped from, which makes
+        # stairs/doors/exits reflect the decision point rather than the landing tile.
         tile_rewards.append((
-            state.get("map_id", 0), state.get("map_name", "unknown"),
-            state.get("player_x", 0), state.get("player_y", 0),
+            before_state.get("map_id", 0), before_state.get("map_name", "unknown"),
+            before_state.get("player_x", 0), before_state.get("player_y", 0),
             reward, value, flag_id,
         ))
 
@@ -217,6 +222,7 @@ def _reload_weights(policy: PokemonPolicy, worker_id: int):
         print(f"[Worker {worker_id}] Reloaded policy weights")
     except Exception as e:
         print(f"[Worker {worker_id}] Weight reload failed: {e}")
+        print(f"[Worker {worker_id}] Waiting for a checkpoint with the new observation shape.")
 
 
 def _get_savestate_path(flag_id: str) -> str | None:

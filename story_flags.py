@@ -99,7 +99,7 @@ STORY_FLAGS: list[StoryFlag] = [
         description="Exit player's house to Pallet Town",
         check=_check_left_house,
         prerequisite=None,
-        max_steps=1000,
+        max_steps=700,
     ),
     StoryFlag(
         id="enter_oaks_lab",

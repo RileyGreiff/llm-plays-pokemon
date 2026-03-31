@@ -26,15 +26,15 @@ CURRICULUM_PATH = os.path.join(SAVE_DIR, "curriculum.json")
 BEST_STEPS_PATH = os.path.join(SAVE_DIR, "best_steps.json")
 
 # Training hyperparameters
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 1e-4
 CLIP_EPSILON = 0.2
-ENTROPY_COEF = 0.05
+ENTROPY_COEF = 0.02
 VALUE_COEF = 0.5
 UPDATE_EPOCHS = 4
 BATCH_SIZE = 64
-GAMMA = 0.99
-GAE_LAMBDA = 0.95
-MIN_BUFFER_SIZE = 128  # minimum steps before PPO update
+GAMMA = 0.995
+GAE_LAMBDA = 0.97
+MIN_BUFFER_SIZE = 256  # minimum steps before PPO update
 
 
 def main():
@@ -66,7 +66,11 @@ def main():
     # Load existing state if available
     if os.path.exists(POLICY_PATH):
         print("Loading saved policy...")
-        trainer.load(POLICY_PATH)
+        try:
+            trainer.load(POLICY_PATH)
+        except Exception as e:
+            print(f"WARNING: Could not load existing policy checkpoint: {e}")
+            print("Starting with fresh policy weights because the observation shape changed.")
     if os.path.exists(CURRICULUM_PATH):
         print("Loading curriculum state...")
         curriculum.load()
