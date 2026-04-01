@@ -134,7 +134,7 @@ def plan_path_to_target(
 
         from exploration import path_to_nearest_tile
         path, pos = path_to_nearest_tile(
-            collision, player_x, player_y, edge_predicate, max_steps=60
+            collision, player_x, player_y, edge_predicate, max_steps=200
         )
         if path is None:
             return None
