@@ -450,14 +450,18 @@ def main():
             map_changed = (map_id != last_map_id) and last_map_id is not None
             map_name = game_state.get("map_name", "UNKNOWN")
 
+            _outdoor_tags = ("TOWN", "CITY", "ROUTE", "LAKE", "ISLAND")
+            is_outdoor_map = any(tag in map_name.upper() for tag in _outdoor_tags)
+
             if map_changed:
                 # If we walked through a door/stairs, label it with destination
                 if last_tile_type in ("D", "S") and last_pos is not None:
                     knowledge.learn_door(last_map_id, last_pos[0], last_pos[1], map_name)
                     print(f"  [knowledge] Door at map {last_map_id} ({last_pos[0]},{last_pos[1]}) -> {map_name}")
-                # Learn map edge connections for the new map
-                map_connections = get_map_connections(map_id)
-                knowledge.learn_map_edges(map_id, map_connections)
+                # Learn map edge connections (outdoor maps only)
+                if is_outdoor_map:
+                    map_connections = get_map_connections(map_id)
+                    knowledge.learn_map_edges(map_id, map_connections)
                 # Clear path on map change — need to re-plan
                 path_state.clear()
 
@@ -523,8 +527,8 @@ def main():
                 if not collision:
                     collision = get_collision_grid(map_id)
                 objects, player_facing = get_objects(game_state)
-                # Learn map edges on first visit
-                if not knowledge.get_map_edges(map_id):
+                # Learn map edges on first visit (outdoor maps only)
+                if is_outdoor_map and not knowledge.get_map_edges(map_id):
                     map_connections = get_map_connections(map_id)
                     knowledge.learn_map_edges(map_id, map_connections)
                 exploration_summary = explorer.get_summary(
@@ -585,10 +589,12 @@ def main():
                         print(f"  [path] Stalled for {path_state.stalled_steps} steps, re-planning")
                         path_state.clear()
 
-                # If no active path, ask LLM for a target
+                # If no active path, ask LLM for a target (try up to 3 times with different targets)
                 if not path_state.active and exploration_summary:
-                    nav_result = get_navigation_target(exploration_summary, progress_summary)
-                    if nav_result:
+                    for _attempt in range(3):
+                        nav_result = get_navigation_target(exploration_summary, progress_summary)
+                        if not nav_result:
+                            break
                         planned = plan_path_to_target(
                             nav_result["target"], collision, px, py, objects
                         )
@@ -605,8 +611,9 @@ def main():
                             path_state.stalled_steps = 0
                             path_state.last_pos = (px, py)
                             print(f"  [path] Target: {nav_result['target']} ({nav_result['reason']}) — {len(planned.path)} steps")
+                            break
                         else:
-                            print(f"  [path] No path found to {nav_result['target']}")
+                            print(f"  [path] No path found to {nav_result['target']}, retrying...")
 
                 # Execute path or arrival action
                 if path_state.active and path_state.path:
@@ -623,8 +630,9 @@ def main():
                     usage = NO_COST
                     path_state.clear()
                 else:
-                    # Fallback: no path planned, call LLM for battle/menu action
-                    action, usage = get_action(game_state, recent_actions, progress_summary)
+                    # No valid path found after retries — press A and try again next tick
+                    action = {"action": "A", "reason": "No reachable target found, waiting", "display": "Waiting for a valid path."}
+                    usage = NO_COST
             else:
                 # Non-overworld (battle, bag, etc.) — call LLM
                 action, usage = get_action(game_state, recent_actions, progress_summary)

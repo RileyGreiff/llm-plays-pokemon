@@ -443,8 +443,8 @@ class ExplorationTracker:
                         dir_str = "-".join(dir_parts) if dir_parts else "here"
                         exit_lines.append((dist, f"  {tile_type} at ({gx},{gy}) -> {label} ({dist} tiles {dir_str})"))
 
-        # Map edge connections
-        if world_knowledge:
+        # Map edge connections (outdoor maps only — indoor maps use doors/warps)
+        if world_knowledge and is_outdoor:
             edges = world_knowledge.get_map_edges(map_id)
             for edge in edges:
                 exit_lines.append((0, f"  {edge['direction']} edge -> {edge['label']}"))
