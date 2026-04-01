@@ -386,6 +386,7 @@ def main():
     last_game_state_str = None
     last_pos: tuple[int, int] | None = None  # for door-learning on map transitions
     last_tile_type: str | None = None         # "D"/"S"/None at last position
+    last_lead_hp: int | None = None           # for detecting heals
     hourly_summaries: list[dict] = []  # last 4 hourly summaries for overlay
     shutting_down = False
 
@@ -503,8 +504,24 @@ def main():
                 progress["tier2_last_action"] = action_count - 50
             check_tier2_update(progress, planner_state, action_count, in_battle=in_battle_now)
 
+            # Detect Pokecenter heal: lead HP went to full while in a Pokecenter
+            party = game_state.get("party", [])
+            lead_hp = party[0].get("hp", 0) if party else 0
+            lead_max_hp = party[0].get("max_hp", 1) if party else 1
+            just_healed = (
+                last_lead_hp is not None
+                and last_lead_hp < lead_max_hp
+                and lead_hp >= lead_max_hp
+                and "POKECENTER" in map_name
+                and not in_battle_now
+            )
+            last_lead_hp = lead_hp
+            if just_healed:
+                print(f"  [heal] Party healed at {map_name}! Refreshing objective.")
+                path_state.clear()  # stop walking to nurse, re-plan
+
             periodic_interval = 10 if in_battle_now else 25
-            needs_objective = map_changed or entered_battle or exited_battle or (action_count > 0 and action_count % periodic_interval == 0)
+            needs_objective = map_changed or entered_battle or exited_battle or just_healed or (action_count > 0 and action_count % periodic_interval == 0)
             if needs_objective:
                 trigger = "map_change" if map_changed else "battle_enter" if entered_battle else "battle_exit" if exited_battle else "periodic"
                 print(f"  [tier3] Triggered by: {trigger} (state={current_game_state_str})")
