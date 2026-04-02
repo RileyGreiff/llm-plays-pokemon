@@ -20,8 +20,9 @@ BATTLE CONTROLS:
 - Use Left/Right/Up/Down to move the cursor, A to confirm selection.
 - To attack: select Fight, then pick a move with PP remaining, press A.
 - Press B to go back from move select to action menu.
-- You CANNOT exit battle with B. To flee, move cursor to Run and press A.
-- Low HP? Consider Run or use a healing item from Bag.
+- You CANNOT exit battle with B. To flee from WILD battles, move cursor to Run and press A.
+- You CANNOT flee from TRAINER battles — you must fight.
+- Low HP in a wild battle? Consider Run or use a healing item from Bag.
 
 BAG/POKEMON/SUMMARY: Press B to go back.
 
@@ -98,15 +99,47 @@ def generate_pokemon_nickname(species_name: str = "", theme: str = "") -> str:
 
 
 def get_navigation_target(exploration_summary: str,
-                          progress_summary: str) -> dict | None:
+                          progress_summary: str,
+                          failed_targets: list[str] | None = None) -> dict | None:
     """Ask Claude to pick a navigation target from the exploration summary.
 
     Returns {"target": str, "reason": str, "display": str} or None on failure.
     Target format: "door:X,Y", "npc:ID", or "edge:DIRECTION".
     """
+    # Remove failed targets from the summary so the LLM can't pick them
+    filtered_summary = exploration_summary
+    if failed_targets:
+        lines = filtered_summary.split("\n")
+        filtered_lines = []
+        for line in lines:
+            skip = False
+            for ft in failed_targets:
+                # Match "door:X,Y" against "door at (X,Y)" lines
+                if ft.startswith("door:"):
+                    coords = ft.split(":", 1)[1]  # "5,51"
+                    x, y = coords.split(",")
+                    if f"door at ({x},{y})" in line:
+                        skip = True
+                        break
+                # Match "edge:direction" against "direction edge" lines
+                elif ft.startswith("edge:"):
+                    direction = ft.split(":", 1)[1]  # "north"
+                    if f"{direction} edge" in line:
+                        skip = True
+                        break
+                # Match "npc:ID" against "NPC #ID" lines
+                elif ft.startswith("npc:"):
+                    npc_id = ft.split(":", 1)[1]  # "4"
+                    if f"NPC #{npc_id}" in line:
+                        skip = True
+                        break
+            if not skip:
+                filtered_lines.append(line)
+        filtered_summary = "\n".join(filtered_lines)
+
     prompt = (
         f"CURRENT PROGRESS: {progress_summary}\n\n"
-        f"{exploration_summary}\n\n"
+        f"{filtered_summary}\n\n"
         "Pick the best target to navigate to."
     )
 
@@ -222,7 +255,10 @@ def build_messages(game_state: dict,
     if gstate == "battle":
         # Battle context
         enemy_name = gs.get("enemy_species", "?")
-        battle_info = f"Enemy: Lv{gs.get('enemy_level', '?')} HP:{gs.get('enemy_hp', '?')}"
+        is_trainer = gs.get("is_trainer_battle", False)
+        battle_info = f"{'TRAINER BATTLE' if is_trainer else 'WILD BATTLE'}: Lv{gs.get('enemy_level', '?')} {gs.get('enemy_species', '?')} HP:{gs.get('enemy_hp', '?')}"
+        if is_trainer:
+            battle_info += " (cannot flee!)"
 
         moves = gs.get("battle_moves", [])
         action_labels = ["Fight", "Bag", "Pokemon", "Run"]
@@ -359,7 +395,9 @@ def build_messages(game_state: dict,
 def get_action(game_state: dict,
                recent_actions: list[dict], progress_summary: str) -> tuple[dict, dict]:
     """Call Claude for battle/bag/menu actions. Returns (parsed_action, usage_info)."""
-    model = HAIKU
+    # Use Sonnet for battles (better tactical decisions), Haiku for menus
+    gstate = game_state.get("game_state", "")
+    model = SONNET if gstate == "battle" else HAIKU
 
     messages = build_messages(game_state, recent_actions, progress_summary)
 

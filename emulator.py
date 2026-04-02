@@ -352,6 +352,7 @@ def read_game_state() -> dict:
         "map_bank": values[2],
         "map_num": values[3],
         "in_battle": values[4] > 0,
+        "is_trainer_battle": values[4] == 2,
         "game_state": game_state_str,
         "party_count": values[5],
         "badges": values[6],

@@ -53,6 +53,29 @@ def parse_target(target_str: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _collision_with_npcs(
+    collision: tuple[int, int, list[str]],
+    objects: list[dict] | None,
+    player_x: int, player_y: int,
+    exclude_npc_id: int | None = None,
+) -> tuple[int, int, list[str]]:
+    """Return a copy of the collision grid with NPC positions marked as walls."""
+    grid_w, grid_h, grid_rows = collision
+    if not objects:
+        return collision
+    # Deep copy the rows so we can mutate them
+    new_rows = [list(row) for row in grid_rows]
+    for obj in objects:
+        ox, oy = obj.get("x", -1), obj.get("y", -1)
+        if (ox, oy) == (player_x, player_y):
+            continue  # Don't block our own tile
+        if exclude_npc_id is not None and obj.get("local_id") == exclude_npc_id:
+            continue  # Don't block the NPC we're walking toward
+        if 0 <= ox < grid_w and 0 <= oy < grid_h:
+            new_rows[oy][ox] = "1"  # Mark as wall
+    return (grid_w, grid_h, new_rows)
+
+
 def plan_path_to_target(
     target_str: str,
     collision: tuple[int, int, list[str]],
@@ -72,9 +95,16 @@ def plan_path_to_target(
             tx, ty = int(x_str), int(y_str)
         except (ValueError, IndexError):
             return None
-        path = path_to_target_tile(collision, player_x, player_y, tx, ty)
+        nav_grid = _collision_with_npcs(collision, objects, player_x, player_y)
+        path = path_to_target_tile(nav_grid, player_x, player_y, tx, ty)
         if path is None:
             return None
+        # Append one extra step to walk THROUGH the door (not just onto it).
+        # Some doors (gates, exits) only warp when you keep walking.
+        # For doors that warp on contact, the map change clears the path
+        # before the extra step executes, so this is harmless.
+        if path:
+            path.append(path[-1])
         state = PathState(
             target_type="door",
             target_id=target_str,
@@ -99,8 +129,10 @@ def plan_path_to_target(
         if not target_obj:
             return None
         # Path to adjacent tile (handles counter-talk too)
+        nav_grid = _collision_with_npcs(collision, objects, player_x, player_y,
+                                         exclude_npc_id=local_id)
         path, _, pos = path_to_adjacent_object(
-            collision, player_x, player_y, objects,
+            nav_grid, player_x, player_y, objects,
             match_fn=lambda o: o.get("local_id") == local_id,
         )
         if path is None:
@@ -133,8 +165,9 @@ def plan_path_to_target(
             return False
 
         from exploration import path_to_nearest_tile
+        nav_grid = _collision_with_npcs(collision, objects, player_x, player_y)
         path, pos = path_to_nearest_tile(
-            collision, player_x, player_y, edge_predicate, max_steps=200
+            nav_grid, player_x, player_y, edge_predicate, max_steps=200
         )
         if path is None:
             return None

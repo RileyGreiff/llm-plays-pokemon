@@ -57,7 +57,7 @@ def path_to_nearest_tile(collision_grid: tuple[int, int, list[str]],
 def path_to_target_tile(collision_grid: tuple[int, int, list[str]],
                         player_x: int, player_y: int,
                         target_x: int, target_y: int,
-                        max_steps: int = 120) -> list[str] | None:
+                        max_steps: int = 500) -> list[str] | None:
     """BFS to a specific reachable tile."""
     try:
         grid_w, grid_h, grid_rows = collision_grid
@@ -344,6 +344,31 @@ def bfs_to_unvisited(collision_grid: tuple[int, int, list[str]],
         return None
 
 
+def _group_doors(doors: list[tuple[int, int, str]]) -> list[list[tuple[int, int, str]]]:
+    """Group door tiles within 1 tile of each other into doorways."""
+    if not doors:
+        return []
+    used = [False] * len(doors)
+    groups = []
+    for i, (x1, y1, t1) in enumerate(doors):
+        if used[i]:
+            continue
+        group = [(x1, y1, t1)]
+        used[i] = True
+        # Flood-fill: find all connected doors within 1 tile
+        queue = [i]
+        while queue:
+            ci = queue.pop(0)
+            cx, cy, _ = doors[ci]
+            for j, (x2, y2, t2) in enumerate(doors):
+                if not used[j] and abs(x2 - cx) <= 1 and abs(y2 - cy) <= 1:
+                    used[j] = True
+                    group.append((x2, y2, t2))
+                    queue.append(j)
+        groups.append(group)
+    return groups
+
+
 class ExplorationTracker:
     def __init__(self):
         # {map_id: {"visits": {"x,y": count}, "walls": ["x,y,dir", ...]}}
@@ -401,10 +426,12 @@ class ExplorationTracker:
                     collision_grid: tuple[int, int, list[str]] = None,
                     objects: list[dict] = None,
                     bg_events: list[dict] = None,
-                    world_knowledge=None) -> str:
+                    world_knowledge=None,
+                    entry_pos: tuple[int, int] | None = None) -> str:
         """Generate exploration summary showing discovered doors/exits and NPCs.
 
         Uses world_knowledge to label doors and NPCs as known or unknown.
+        entry_pos: where the player spawned on this map (used to mark entrance doors).
         """
         if player_x is None or player_y is None:
             return ""
@@ -420,28 +447,58 @@ class ExplorationTracker:
         if collision_grid:
             grid_w, grid_h, grid_rows = collision_grid
 
-            # Find all door/stair tiles on the map
+            # Collect all door/stair tiles, then group adjacent ones into doorways
+            raw_doors = []
             for gy in range(grid_h):
                 for gx in range(grid_w):
                     if grid_rows[gy][gx] in ("D", "S"):
-                        dist = abs(gx - player_x) + abs(gy - player_y)
-                        # Register in world knowledge so it appears as "unknown" if new
                         if world_knowledge:
                             world_knowledge.ensure_door(map_id, gx, gy)
-                            label = world_knowledge.get_door_label(map_id, gx, gy)
-                        else:
-                            label = "unknown"
-                        tile_type = "stairs" if grid_rows[gy][gx] == "S" else "door"
-                        # Direction hint from player
-                        dy = gy - player_y
-                        dx = gx - player_x
-                        dir_parts = []
-                        if dy < 0: dir_parts.append("north")
-                        if dy > 0: dir_parts.append("south")
-                        if dx < 0: dir_parts.append("west")
-                        if dx > 0: dir_parts.append("east")
-                        dir_str = "-".join(dir_parts) if dir_parts else "here"
-                        exit_lines.append((dist, f"  {tile_type} at ({gx},{gy}) -> {label} ({dist} tiles {dir_str})"))
+                        raw_doors.append((gx, gy, grid_rows[gy][gx]))
+
+            # Group door tiles within 1 tile of each other into doorways
+            doorways = _group_doors(raw_doors)
+
+            for doorway in doorways:
+                # Use the center tile as the representative coordinate
+                rep_x = doorway[len(doorway) // 2][0]
+                rep_y = doorway[len(doorway) // 2][1]
+                tile_code = doorway[0][2]
+                dist = abs(rep_x - player_x) + abs(rep_y - player_y)
+
+                # Label from world knowledge (use best known label from any tile in group)
+                label = "unknown"
+                if world_knowledge:
+                    for dx, dy, _ in doorway:
+                        dl = world_knowledge.get_door_label(map_id, dx, dy)
+                        if dl != "unknown":
+                            label = dl
+                            break
+
+                tile_type = "stairs" if tile_code == "S" else "door"
+
+                # Check if this doorway is the entrance (player spawned here)
+                is_entrance = False
+                if entry_pos:
+                    for dx, dy, _ in doorway:
+                        if abs(dx - entry_pos[0]) <= 1 and abs(dy - entry_pos[1]) <= 1:
+                            is_entrance = True
+                            break
+
+                # Direction hint from player
+                dy_diff = rep_y - player_y
+                dx_diff = rep_x - player_x
+                dir_parts = []
+                if dy_diff < 0: dir_parts.append("north")
+                if dy_diff > 0: dir_parts.append("south")
+                if dx_diff < 0: dir_parts.append("west")
+                if dx_diff > 0: dir_parts.append("east")
+                dir_str = "-".join(dir_parts) if dir_parts else "here"
+
+                # Hide entrance door only on outdoor/large maps with other exits
+                if is_entrance and is_outdoor and len(doorways) > 1:
+                    continue
+                exit_lines.append((dist, f"  {tile_type} at ({rep_x},{rep_y}) -> {label} ({dist} tiles {dir_str})"))
 
         # Map edge connections (outdoor maps only — indoor maps use doors/warps)
         if world_knowledge and is_outdoor:

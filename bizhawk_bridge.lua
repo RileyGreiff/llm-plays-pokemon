@@ -161,7 +161,12 @@ local function handle_command(cmd)
         end
         local battlers = 0
         if game_state_str == "battle" then
-            battlers = 1
+            local battleTypeFlags = ru32(0x02022B4C)  -- gBattleTypeFlags
+            if (battleTypeFlags & 0x08) > 0 then      -- BATTLE_TYPE_TRAINER
+                battlers = 2
+            else
+                battlers = 1  -- wild battle
+            end
         end
 
         local partycount = ru8(0x02024029)
@@ -169,8 +174,9 @@ local function handle_command(cmd)
         local msgbox = ru8(0x0203709C)
         local scriptState = ru8(0x03000EB0)
         local textFlags = ru8(0x02021064)
+        local lockField = ru8(0x0203707E)  -- sLockFieldControls: 1 when player controls locked (trainer approach, scripts)
         local dialogue = 0
-        if msgbox > 0 or scriptState > 0 or (textFlags & 1) == 1 then
+        if msgbox > 0 or scriptState > 0 or (textFlags & 1) == 1 or lockField > 0 then
             dialogue = 1
         end
 

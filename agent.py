@@ -340,6 +340,10 @@ def _get_battle_menu_action(game_state: dict, llm_action: dict | None = None) ->
             str(llm_action.get(key, "")) for key in ("action", "reason", "display")
         ).lower()
 
+    # Never auto-flee trainer battles
+    if game_state.get("is_trainer_battle", False):
+        return None
+
     hp = game_state.get("player_hp", 0)
     max_hp = max(game_state.get("party", [{}])[0].get("max_hp", 0), 1) if game_state.get("party") else 1
     low_hp = hp > 0 and hp / max_hp <= 0.3
@@ -385,8 +389,11 @@ def main():
     last_map_id = None
     last_game_state_str = None
     last_pos: tuple[int, int] | None = None  # for door-learning on map transitions
+    prev_pos: tuple[int, int] | None = None   # position from 2 frames ago
     last_tile_type: str | None = None         # "D"/"S"/None at last position
+    prev_tile_type: str | None = None         # tile type from 2 frames ago (catches walk-through doors)
     last_lead_hp: int | None = None           # for detecting heals
+    entry_pos: tuple[int, int] | None = None  # where player spawned on current map
     hourly_summaries: list[dict] = []  # last 4 hourly summaries for overlay
     shutting_down = False
 
@@ -456,13 +463,21 @@ def main():
 
             if map_changed:
                 # If we walked through a door/stairs, label it with destination
+                # Check both last and prev tile type to handle walk-through extra step
                 if last_tile_type in ("D", "S") and last_pos is not None:
                     knowledge.learn_door(last_map_id, last_pos[0], last_pos[1], map_name)
                     print(f"  [knowledge] Door at map {last_map_id} ({last_pos[0]},{last_pos[1]}) -> {map_name}")
+                elif prev_tile_type in ("D", "S") and prev_pos is not None:
+                    knowledge.learn_door(last_map_id, prev_pos[0], prev_pos[1], map_name)
+                    print(f"  [knowledge] Door at map {last_map_id} ({prev_pos[0]},{prev_pos[1]}) -> {map_name}")
                 # Learn map edge connections (outdoor maps only)
                 if is_outdoor_map:
                     map_connections = get_map_connections(map_id)
                     knowledge.learn_map_edges(map_id, map_connections)
+                # Remember where we spawned so we can mark the entrance door
+                # Skip on battle returns — map_id may change during battle
+                if last_game_state_str != "battle":
+                    entry_pos = (px, py)
                 # Clear path on map change — need to re-plan
                 path_state.clear()
 
@@ -476,7 +491,9 @@ def main():
                     if 0 <= px < grid_w and 0 <= py < grid_h:
                         current_tile_type = grid_rows[py][px]
 
+            prev_pos = last_pos
             last_pos = (px, py)
+            prev_tile_type = last_tile_type
             last_tile_type = current_tile_type
             last_map_id = map_id
 
@@ -551,6 +568,7 @@ def main():
                 exploration_summary = explorer.get_summary(
                     map_id, map_name, px, py, collision, objects,
                     world_knowledge=knowledge,
+                    entry_pos=entry_pos,
                 ) or None
                 if exploration_summary:
                     print(f"  [explore]\n{exploration_summary}")
@@ -608,8 +626,12 @@ def main():
 
                 # If no active path, ask LLM for a target (try up to 3 times with different targets)
                 if not path_state.active and exploration_summary:
+                    failed_targets = []
                     for _attempt in range(3):
-                        nav_result = get_navigation_target(exploration_summary, progress_summary)
+                        nav_result = get_navigation_target(
+                            exploration_summary, progress_summary,
+                            failed_targets=failed_targets if failed_targets else None,
+                        )
                         if not nav_result:
                             break
                         planned = plan_path_to_target(
@@ -630,7 +652,8 @@ def main():
                             print(f"  [path] Target: {nav_result['target']} ({nav_result['reason']}) — {len(planned.path)} steps")
                             break
                         else:
-                            print(f"  [path] No path found to {nav_result['target']}, retrying...")
+                            failed_targets.append(nav_result["target"])
+                            print(f"  [path] No path found to {nav_result['target']}, retrying (failed: {failed_targets})...")
 
                 # Execute path or arrival action
                 if path_state.active and path_state.path:
