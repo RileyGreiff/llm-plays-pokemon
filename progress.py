@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from datetime import datetime
 
 import anthropic
@@ -357,12 +358,18 @@ def rethink_tier2(game_state: dict, tier1_objective: str, in_battle: bool = Fals
         enemy_level = game_state.get("enemy_level", "?")
         enemy_hp = game_state.get("enemy_hp", "?")
         battle_moves = _format_battle_moves(game_state)
+        trainer_note = (
+            "This is a trainer battle, so fleeing is impossible.\n"
+            if game_state.get("is_trainer_battle", False)
+            else "This is a wild battle, so fleeing is allowed.\n"
+        )
         prompt = (
             f"You are a Pokemon FireRed battle advisor. "
             f"Player is in battle on {map_name}.\n"
             f"Enemy: Lv{enemy_level} (species#{enemy}) HP:{enemy_hp}\n"
             f"Party: {party_str}\n"
             f"{battle_moves}\n"
+            f"{trainer_note}"
             f"{progress_facts}\n"
             f"What battle strategy should the player use? Consider:\n"
             f"- Moves with 0 PP are unusable and should not be recommended.\n"
@@ -410,11 +417,18 @@ def rethink_tier2(game_state: dict, tier1_objective: str, in_battle: bool = Fals
             f"Reply with ONE concise strategy sentence (what to do and why)."
         )
 
+    print(
+        f"  [claude:tier2] Requesting {'battle' if in_battle else 'overworld'} strategy "
+        f"on {map_name} (badges={badges}, hp={game_state.get('player_hp', 0)})"
+    )
+    started = time.monotonic()
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=80,
         messages=[{"role": "user", "content": prompt}],
     )
+    elapsed = time.monotonic() - started
+    print(f"  [claude:tier2] Response received in {elapsed:.2f}s")
 
     return response.content[0].text.strip()
 
@@ -453,12 +467,18 @@ def rethink_objective(game_state: dict, tier2_objective: str = "", in_battle: bo
 
     if in_battle:
         battle_moves = _format_battle_moves(game_state)
+        trainer_note = (
+            "This is a trainer battle, so the player cannot flee. "
+            if game_state.get("is_trainer_battle", False)
+            else "This is a wild battle, so fleeing is allowed if needed. "
+        )
         prompt = (
             f"You are guiding a Pokemon FireRed battle. "
             f"Party: {party_str}.\n"
             f"{battle_moves}\n"
             f"{progress_facts}"
             f"{strategy_context} "
+            f"{trainer_note}"
             f"Moves with 0 PP are unusable. "
             f"What should the player do RIGHT NOW in this battle turn? "
             f"Reply with ONLY one specific, actionable sentence."
@@ -496,11 +516,18 @@ def rethink_objective(game_state: dict, tier2_objective: str = "", in_battle: bo
             f"Reply with ONLY one specific, actionable sentence."
         )
 
+    print(
+        f"  [claude:tier3] Requesting {'battle' if in_battle else 'overworld'} objective "
+        f"on {game_state.get('map_name', '?')} (badges={game_state.get('badges', 0)})"
+    )
+    started = time.monotonic()
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=50,
         messages=[{"role": "user", "content": prompt}],
     )
+    elapsed = time.monotonic() - started
+    print(f"  [claude:tier3] Response received in {elapsed:.2f}s")
 
     return response.content[0].text.strip()
 

@@ -162,6 +162,7 @@ def get_objects(game_state: dict | None = None) -> tuple[list[dict], int | None]
 
 _bg_events_cache: dict[int, list[dict]] = {}
 _map_connections_cache: dict[int, list[dict]] = {}
+_warp_events_cache: dict[int, list[dict]] = {}
 
 
 def get_bg_events(map_id: int) -> list[dict]:
@@ -239,6 +240,48 @@ def get_map_connections(map_id: int) -> list[dict]:
     _map_connections_cache[map_id] = connections
     print(f"  [connections] Loaded {len(connections)} connections for map {map_id}")
     return connections
+
+
+def get_warp_events(map_id: int) -> list[dict]:
+    """Fetch warp events for the current map. Cached per map_id."""
+    if map_id in _warp_events_cache:
+        return _warp_events_cache[map_id]
+
+    try:
+        result = _send_command("WARP_EVENTS")
+    except (ConnectionError, TimeoutError, OSError):
+        return []
+
+    if result.startswith("ERROR"):
+        return []
+    if not result:
+        _warp_events_cache[map_id] = []
+        return []
+
+    warps = []
+    for entry in result.split("|"):
+        if not entry:
+            continue
+        try:
+            x_str, y_str, warp_id_str, group_str, num_str = entry.split(",")
+            map_group = int(group_str)
+            map_num = int(num_str)
+            target_name = MAP_NAMES.get((map_group, map_num), f"MAP_{map_group}_{map_num}")
+            warps.append({
+                "x": int(x_str),
+                "y": int(y_str),
+                "destination_warp_id": int(warp_id_str),
+                "map_group": map_group,
+                "map_num": map_num,
+                "destination_map_id": map_group * 256 + map_num,
+                "destination_map": target_name,
+            })
+        except (ValueError, IndexError):
+            continue
+
+    _warp_events_cache[map_id] = warps
+    print(f"  [warp_events] Loaded {len(warps)} warps for map {map_id}")
+    return warps
 
 
 def debug_objects():
@@ -495,8 +538,22 @@ def read_game_state() -> dict:
         try:
             state["bag_items"] = _parse_bag_data(bag_raw)
             pocket_name = state["bag_items"]["pocket_name"]
+            cursor = state["bag_items"]["cursor"]
+            scroll = state["bag_items"]["scroll"]
             item_count = sum(len(v) for v in state["bag_items"]["pockets"].values())
-            print(f"  [bag] Pocket: {pocket_name}, {item_count} total items")
+            pocket_keys = ["Items", "KeyItems", "PokeBalls", "TMs", "Berries"]
+            current_idx = state["bag_items"]["current_pocket"]
+            pocket_key = pocket_keys[current_idx] if current_idx < len(pocket_keys) else pocket_keys[0]
+            visible_items = state["bag_items"]["pockets"].get(pocket_key, [])
+            selected_idx = scroll + cursor
+            selected_name = ""
+            if 0 <= selected_idx < len(visible_items):
+                selected_name = visible_items[selected_idx].get("name", "")
+            print(
+                f"  [bag] Pocket: {pocket_name}, {item_count} total items | "
+                f"cursor={cursor} scroll={scroll} selected_idx={selected_idx} "
+                f"selected={selected_name or '<none>'}"
+            )
         except Exception as e:
             print(f"  [bag] Parse error: {e}")
 

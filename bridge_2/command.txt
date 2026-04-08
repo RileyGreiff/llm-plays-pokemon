@@ -1,0 +1,1 @@
+LOADSTATE C:\Users\rgrei\Documents\Portfolio website\LLM Plays Pokemon\savestates\default.State

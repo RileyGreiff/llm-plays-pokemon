@@ -591,6 +591,29 @@ local function handle_command(cmd)
 
         return table.concat(results, "|")
 
+    elseif cmd == "WARP_EVENTS" then
+        local map_header = 0x02036DFC
+        local events_ptr = memory.read_u32_le(map_header + 0x04)
+        if events_ptr == 0 then return "ERROR:no_events_ptr" end
+
+        local warp_count = memory.read_u8(events_ptr + 0x01)
+        local warp_ptr = memory.read_u32_le(events_ptr + 0x08)
+        local results = {}
+
+        if warp_ptr ~= 0 then
+            for i = 0, math.min(warp_count - 1, 63) do
+                local base = warp_ptr + i * 8
+                local x = memory.read_u16_le(base + 0x00)
+                local y = memory.read_u16_le(base + 0x02)
+                local destWarpId = memory.read_u8(base + 0x05)
+                local destMapNum = memory.read_u8(base + 0x06)
+                local destMapGroup = memory.read_u8(base + 0x07)
+                table.insert(results, x .. "," .. y .. "," .. destWarpId .. "," .. destMapGroup .. "," .. destMapNum)
+            end
+        end
+
+        return table.concat(results, "|")
+
     elseif cmd == "MAP_CONNECTIONS" then
         local map_header = 0x02036DFC
         local conn_header = memory.read_u32_le(map_header + 0x0C)

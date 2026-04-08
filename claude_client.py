@@ -5,6 +5,7 @@ import io
 import json
 import random
 import re
+import time
 import anthropic
 from PIL import Image
 
@@ -42,11 +43,44 @@ RULES:
 - Read NPC dialogue summaries to decide if you need to talk to them again.
 
 TARGET TYPES:
-- "door:X,Y" — walk to a door/stairs tile and enter it
+- "door:X,Y" — walk to a door tile and enter it
+- "stairs:X,Y" — walk to a stairs tile and use it
 - "npc:ID" — walk to an NPC and talk to them
 - "edge:DIRECTION" — walk to the map edge to leave (north/south/east/west)
 
 Respond ONLY with valid JSON:
+{"target": "<target_id>", "reason": "<why, under 40 words>", "display": "<casual 25-word viewer summary>"}"""
+
+SYSTEM_PROMPT = """Play Pokemon FireRed and reply with JSON only.
+
+Valid buttons: A, B, Up, Down, Left, Right, Start, Select.
+
+Battle:
+- Action menu is Fight / Bag / Pokemon / Run.
+- Move menu chooses a move with PP > 0.
+- B only backs out of move select.
+- Trainer battles cannot flee.
+- Wild battles may flee by selecting Run.
+
+Menus:
+- In bag, pokemon, and summary menus, B backs out.
+
+Return exactly:
+{"action": "<button>", "reason": "<why, under 40 words>", "display": "<casual 25-word viewer summary>"}"""
+
+NAV_SYSTEM_PROMPT = """Pick one navigation target for Pokemon FireRed.
+
+Prefer targets that advance the current objective.
+Unknown exits and unknown NPCs are worth exploring when relevant.
+If you are in the wrong area, choose the exit that best moves toward the destination.
+
+Valid target formats:
+- "door:X,Y"
+- "stairs:X,Y"
+- "npc:ID"
+- "edge:DIRECTION"
+
+Return exactly:
 {"target": "<target_id>", "reason": "<why, under 40 words>", "display": "<casual 25-word viewer summary>"}"""
 
 client = anthropic.Anthropic()
@@ -104,7 +138,7 @@ def get_navigation_target(exploration_summary: str,
     """Ask Claude to pick a navigation target from the exploration summary.
 
     Returns {"target": str, "reason": str, "display": str} or None on failure.
-    Target format: "door:X,Y", "npc:ID", or "edge:DIRECTION".
+    Target format: "door:X,Y", "stairs:X,Y", "npc:ID", or "edge:DIRECTION".
     """
     # Remove failed targets from the summary so the LLM can't pick them
     filtered_summary = exploration_summary
@@ -114,11 +148,11 @@ def get_navigation_target(exploration_summary: str,
         for line in lines:
             skip = False
             for ft in failed_targets:
-                # Match "door:X,Y" against "door at (X,Y)" lines
-                if ft.startswith("door:"):
+                # Match "door:X,Y" or "stairs:X,Y" against exit lines
+                if ft.startswith("door:") or ft.startswith("stairs:"):
                     coords = ft.split(":", 1)[1]  # "5,51"
                     x, y = coords.split(",")
-                    if f"door at ({x},{y})" in line:
+                    if f"door at ({x},{y})" in line or f"stairs at ({x},{y})" in line:
                         skip = True
                         break
                 # Match "edge:direction" against "direction edge" lines
@@ -138,12 +172,14 @@ def get_navigation_target(exploration_summary: str,
         filtered_summary = "\n".join(filtered_lines)
 
     prompt = (
-        f"CURRENT PROGRESS: {progress_summary}\n\n"
+        f"PROGRESS: {_compact_progress_summary(progress_summary, battle=False)}\n\n"
         f"{filtered_summary}\n\n"
-        "Pick the best target to navigate to."
+        "Pick the best target."
     )
 
     try:
+        print("  [claude:navigation] Requesting navigation target")
+        started = time.monotonic()
         response = client.messages.create(
             model=HAIKU,
             max_tokens=150,
@@ -157,6 +193,8 @@ def get_navigation_target(exploration_summary: str,
                 {"role": "assistant", "content": '{"target": "'},
             ],
         )
+        elapsed = time.monotonic() - started
+        print(f"  [claude:navigation] Response received in {elapsed:.2f}s")
     except Exception:
         return None
 
@@ -178,7 +216,12 @@ def get_navigation_target(exploration_summary: str,
 
     target = str(parsed["target"]).strip()
     # Validate target format
-    if not (target.startswith("door:") or target.startswith("npc:") or target.startswith("edge:")):
+    if not (
+        target.startswith("door:")
+        or target.startswith("stairs:")
+        or target.startswith("npc:")
+        or target.startswith("edge:")
+    ):
         return None
 
     reason = str(parsed.get("reason", "")).strip()[:120]
@@ -225,22 +268,47 @@ def _strip_coordinates(text: str) -> str:
     return text
 
 
+def _compact_progress_summary(progress_summary: str, *, battle: bool = False) -> str:
+    """Compress the verbose progress summary into a shorter prompt line."""
+    lines = [line.strip() for line in progress_summary.splitlines() if line.strip()]
+    header = lines[0] if lines else ""
+    goal = next((line[5:].strip() for line in lines if line.startswith("GOAL:")), "")
+    strategy = next((line[9:].strip() for line in lines if line.startswith("STRATEGY:")), "")
+    task = next((line[13:].strip() for line in lines if line.startswith("CURRENT TASK:")), "")
+
+    parts = []
+    if header and not battle:
+        parts.append(header)
+    if goal:
+        parts.append(f"goal={goal}")
+    if strategy and not battle:
+        parts.append(f"strategy={strategy}")
+    if task:
+        parts.append(f"task={task}")
+    return " | ".join(parts)
+
+
+def _cursor_slot_name(slot: int) -> str:
+    return {0: "TL", 1: "TR", 2: "BL", 3: "BR"}.get(slot, "?")
+
+
 def build_messages(game_state: dict,
                    recent_actions: list[dict], progress_summary: str,
                    exploration_summary: str | None = None) -> list[dict]:
     """Build the messages array for the API call (battle/bag/menu states)."""
     parts = []
 
-    parts.append(f"CURRENT PROGRESS: {progress_summary}")
-
-    # Section 2: Current state — context depends on game_state
     gs = game_state
     gstate = gs.get("game_state", "overworld")
+    in_battle = gs.get("in_battle", False)
+    parts.append(f"PROGRESS: {_compact_progress_summary(progress_summary, battle=in_battle)}")
+
+    in_battle = gs.get("in_battle", False)
 
     party_info = ""
     party = gs.get("party", [])
     if party:
-        party_strs = [f"{p['name']} Lv{p['level']} {p['hp']}/{p['max_hp']}HP" for p in party]
+        party_strs = [f"{p['name']} L{p['level']} {p['hp']}/{p['max_hp']}" for p in party]
         party_info = f"\nParty: {', '.join(party_strs)}"
 
     # Dialogue text from memory
@@ -253,67 +321,52 @@ def build_messages(game_state: dict,
         dialogue_line = "\nDIALOGUE TEXT: unavailable or unreliable; do not assume repeated A will help."
 
     if gstate == "battle":
-        # Battle context
-        enemy_name = gs.get("enemy_species", "?")
         is_trainer = gs.get("is_trainer_battle", False)
-        battle_info = f"{'TRAINER BATTLE' if is_trainer else 'WILD BATTLE'}: Lv{gs.get('enemy_level', '?')} {gs.get('enemy_species', '?')} HP:{gs.get('enemy_hp', '?')}"
+        battle_info = (
+            f"{'TRAINER' if is_trainer else 'WILD'} BATTLE | "
+            f"enemy=L{gs.get('enemy_level', '?')} {gs.get('enemy_species', '?')} hp={gs.get('enemy_hp', '?')}"
+        )
         if is_trainer:
-            battle_info += " (cannot flee!)"
+            battle_info += " | no flee"
 
         moves = gs.get("battle_moves", [])
         action_labels = ["Fight", "Bag", "Pokemon", "Run"]
         action_cursor = gs.get("battle_action_cursor", 0)
         move_cursor = gs.get("battle_move_cursor", 0)
         menu_state = gs.get("battle_menu_state", 1)
-        # Vanilla FireRed values: 1=action menu, 2=move select, 4=executing/animations
-
         if menu_state == 2:
-            # Move select screen
-            battle_info += "\n=== MOVE SELECT ==="
-            cursor_move = None
+            battle_info += "\nMOVE MENU"
             if moves:
                 move_slots = ["(empty)"] * 4
                 for m in moves:
-                    pp_str = f"{m['pp']} PP"
-                    if m["pp"] <= 0:
-                        pp_str = "0 PP (unusable)"
-                    move_slots[m["slot"]] = f"{m['name']} [{pp_str}]"
-                    if m["slot"] == move_cursor:
-                        cursor_move = move_slots[m["slot"]]
-                # Show as 2x2 grid with position labels
-                battle_info += f"\n  Top-Left: {move_slots[0]}  |  Top-Right: {move_slots[1]}"
-                battle_info += f"\n  Bot-Left: {move_slots[2]}  |  Bot-Right: {move_slots[3]}"
-            pos_names = {0: "Top-Left", 1: "Top-Right", 2: "Bot-Left", 3: "Bot-Right"}
-            battle_info += f"\nCursor is on: {cursor_move or '???'} ({pos_names.get(move_cursor, '?')}). Press A to use it."
-            battle_info += "\nMoves with 0 PP cannot be used. Left/Right = move horizontal. Up/Down = move vertical. B = back to action menu."
+                    pp_str = f"{m['pp']}" if m["pp"] > 0 else "0!"
+                    move_slots[m["slot"]] = f"{m['name']}[{pp_str}]"
+                battle_info += f"\nTL={move_slots[0]} | TR={move_slots[1]}"
+                battle_info += f"\nBL={move_slots[2]} | BR={move_slots[3]}"
+            battle_info += f"\ncursor={_cursor_slot_name(move_cursor)}"
 
         elif menu_state == 1:
-            # Action menu
             action_name = action_labels[action_cursor] if action_cursor < 4 else "?"
-            battle_info += "\n=== ACTION MENU ==="
-            battle_info += f"\nCursor: [{action_name}]"
-            battle_info += "\n  Fight (top-left)   | Bag (top-right)"
-            battle_info += "\n  Pokemon (bot-left) | Run (bot-right)"
+            battle_info += "\nACTION MENU"
+            battle_info += f"\ncursor={action_name}"
+            battle_info += "\nTL=Fight | TR=Bag"
+            battle_info += "\nBL=Pokemon | BR=Run"
             if moves:
-                move_lines = []
-                for m in moves:
-                    status = f"{m['pp']} PP" if m["pp"] > 0 else "0 PP (unusable)"
-                    move_lines.append(f"{m['name']} [{status}]")
-                battle_info += f"\nAvailable moves: {', '.join(move_lines)}"
-            battle_info += "\nLeft/Right = horizontal, Up/Down = vertical. A = select. B does nothing here."
+                move_lines = [f"{m['name']}[{m['pp'] if m['pp'] > 0 else '0!'}]" for m in moves]
+                battle_info += f"\nMoves: {', '.join(move_lines)}"
 
         else:
-            # Executing/animations (menu_state == 4 or other)
-            battle_info += "\nBattle animation in progress. Press A to advance text/animation."
+            battle_info += "\nANIMATION/TEXT"
 
         parts.append(
             f"=== BATTLE ===\n"
             f"{battle_info}\n"
-            f"{party_info}{dialogue_line}"
+            f"{party_info}{dialogue_line if menu_state not in (1, 2) else ''}"
         )
 
     elif gstate == "bag":
         bag = gs.get("bag_items")
+        in_battle_bag = gs.get("in_battle", False)
         if bag:
             pocket_keys = ["Items", "KeyItems", "PokeBalls", "TMs", "Berries"]
             display_names = ["Items", "Key Items", "Poke Balls", "TMs & HMs", "Berries"]
@@ -336,18 +389,24 @@ def build_messages(game_state: dict,
                 qty_str = f" x{item['quantity']}" if item["quantity"] > 1 else ""
                 item_lines.append(f"{marker}{item['name']}{qty_str}")
 
-            bag_display = f"=== BAG ===\nPockets: {' | '.join(tabs)}\n"
+            bag_title = "=== BATTLE BAG ===" if in_battle_bag else "=== BAG ==="
+            bag_display = f"{bag_title}\nPockets: {' | '.join(tabs)}\n"
             if item_lines:
                 bag_display += "\n".join(item_lines)
             else:
                 bag_display += "    (empty)"
-            bag_display += "\nLeft/Right = switch pocket. Up/Down = scroll. A = use item. B = close bag."
+            if in_battle_bag:
+                trainer_note = " Trainer battle: Run is unavailable." if gs.get("is_trainer_battle", False) else ""
+                bag_display += "\nBattle bag: Up/Down = choose item. A = use item. B = return to battle menu." + trainer_note
+            else:
+                bag_display += "\nLeft/Right = switch pocket. Up/Down = scroll. A = use item. B = close bag."
 
             parts.append(bag_display + f"{party_info}{dialogue_line}")
         else:
+            bag_title = "=== BATTLE BAG ===" if in_battle_bag else "=== BAG ==="
             parts.append(
-                f"=== BAG ===\n"
-                f"Bag is open. Left/Right = switch pocket. Up/Down = scroll. A = use. B = close."
+                f"{bag_title}\n"
+                f"{'Bag is open during battle. A = use item. B = return to battle menu.' if in_battle_bag else 'Bag is open. Left/Right = switch pocket. Up/Down = scroll. A = use. B = close.'}"
                 f"{party_info}{dialogue_line}"
             )
 
@@ -397,7 +456,7 @@ def get_action(game_state: dict,
     """Call Claude for battle/bag/menu actions. Returns (parsed_action, usage_info)."""
     # Use Sonnet for battles (better tactical decisions), Haiku for menus
     gstate = game_state.get("game_state", "")
-    model = SONNET if gstate == "battle" else HAIKU
+    model = SONNET if game_state.get("in_battle", False) else HAIKU
 
     messages = build_messages(game_state, recent_actions, progress_summary)
 
@@ -405,9 +464,14 @@ def get_action(game_state: dict,
     if "haiku" in model:
         messages.append({"role": "assistant", "content": '{"action": "'})
 
+    print(
+        f"  [claude:action] Requesting action for state={gstate} "
+        f"map={game_state.get('map_name', '?')} battle={game_state.get('in_battle', False)}"
+    )
+    started = time.monotonic()
     response = client.messages.create(
         model=model,
-        max_tokens=400,
+        max_tokens=180,
         system=[{
             "type": "text",
             "text": SYSTEM_PROMPT,
@@ -415,6 +479,8 @@ def get_action(game_state: dict,
         }],
         messages=messages,
     )
+    elapsed = time.monotonic() - started
+    print(f"  [claude:action] Response received in {elapsed:.2f}s")
 
     raw_text = response.content[0].text.strip()
 

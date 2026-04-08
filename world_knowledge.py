@@ -6,6 +6,12 @@ import os
 SAVE_PATH = "logs/world_knowledge.json"
 
 
+def _titleize_map_name(map_name: str | None) -> str:
+    if not map_name:
+        return "unknown"
+    return map_name.replace("_", " ").title()
+
+
 class WorldKnowledge:
     def __init__(self):
         self.doors: dict[str, dict] = {}      # "map_id:x,y" -> {label, destination_map}
@@ -47,22 +53,47 @@ class WorldKnowledge:
         if key not in self.doors:
             self.doors[key] = {"label": "unknown", "destination_map": None}
 
+    def set_door_destination_hint(self, from_map_id: int, from_x: int, from_y: int,
+                                  destination_map_name: str,
+                                  *,
+                                  destination_map_id: int | None = None,
+                                  destination_warp_id: int | None = None):
+        """Attach static destination metadata without overwriting observed landing data."""
+        key = self._door_key(from_map_id, from_x, from_y)
+        existing = self.doors.get(key, {"label": "unknown", "destination_map": None})
+        updated = dict(existing)
+        updated["destination_map"] = destination_map_name
+        updated["destination_map_id"] = destination_map_id
+        updated["destination_warp_id"] = destination_warp_id
+        updated["label"] = self._build_door_label(from_map_id, updated)
+        self.doors[key] = updated
+
     def learn_door(self, from_map_id: int, from_x: int, from_y: int,
-                   destination_map_name: str):
+                   destination_map_name: str,
+                   *,
+                   destination_map_id: int | None = None,
+                   destination_warp_id: int | None = None,
+                   destination_x: int | None = None,
+                   destination_y: int | None = None):
         """Label a door after walking through it."""
         key = self._door_key(from_map_id, from_x, from_y)
-        # Make a human-friendly label from the map name
-        label = destination_map_name.replace("_", " ").title()
-        self.doors[key] = {
-            "label": label,
+        entry = {
             "destination_map": destination_map_name,
+            "destination_map_id": destination_map_id,
+            "destination_warp_id": destination_warp_id,
+            "destination_x": destination_x,
+            "destination_y": destination_y,
+        }
+        self.doors[key] = {
+            "label": self._build_door_label(from_map_id, entry),
+            **entry,
         }
 
     def get_door_label(self, map_id: int, x: int, y: int) -> str:
         key = self._door_key(map_id, x, y)
         entry = self.doors.get(key)
         if entry and entry.get("destination_map"):
-            return entry["label"]
+            return self._build_door_label(map_id, entry)
         return "unknown"
 
     def get_doors_on_map(self, map_id: int) -> list[dict]:
@@ -76,10 +107,40 @@ class WorldKnowledge:
                 results.append({
                     "x": int(x),
                     "y": int(y),
-                    "label": entry.get("label", "unknown"),
+                    "label": self._build_door_label(map_id, entry) if entry.get("destination_map") else entry.get("label", "unknown"),
                     "destination_map": entry.get("destination_map"),
+                    "destination_map_id": entry.get("destination_map_id"),
+                    "destination_warp_id": entry.get("destination_warp_id"),
+                    "destination_x": entry.get("destination_x"),
+                    "destination_y": entry.get("destination_y"),
                 })
         return results
+
+    def _build_door_label(self, from_map_id: int, entry: dict) -> str:
+        destination_map = entry.get("destination_map")
+        if not destination_map:
+            return entry.get("label", "unknown")
+
+        base_label = _titleize_map_name(destination_map)
+        same_destination_count = sum(
+            1
+            for key, other in self.doors.items()
+            if key.startswith(f"{from_map_id}:") and other.get("destination_map") == destination_map
+        )
+
+        if same_destination_count <= 1:
+            return base_label
+
+        destination_x = entry.get("destination_x")
+        destination_y = entry.get("destination_y")
+        if destination_x is not None and destination_y is not None:
+            return f"{base_label} @ ({destination_x},{destination_y})"
+
+        destination_warp_id = entry.get("destination_warp_id")
+        if destination_warp_id is not None:
+            return f"{base_label} (warp {destination_warp_id})"
+
+        return base_label
 
     # --- NPCs ---
 
@@ -130,7 +191,7 @@ class WorldKnowledge:
             if key.startswith(prefix):
                 direction = key[len(prefix):]
                 dest = entry.get("destination_map", "unknown")
-                label = dest.replace("_", " ").title()
+                label = _titleize_map_name(dest)
                 results.append({
                     "direction": direction,
                     "destination_map": dest,

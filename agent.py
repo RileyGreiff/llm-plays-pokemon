@@ -14,9 +14,9 @@ import websockets
 load_dotenv()
 
 import signal
-from emulator import press_button, read_game_state, test_connection, get_collision_grid, get_objects, get_map_connections
+from emulator import press_button, read_game_state, test_connection, get_collision_grid, get_objects, get_map_connections, get_warp_events
 from claude_client import get_action, get_navigation_target, HAIKU, SONNET
-from exploration import ExplorationTracker
+from exploration import ExplorationTracker, is_outdoor_map_name
 from navigation import PathState, plan_path_to_target, get_arrival_action
 from world_knowledge import WorldKnowledge
 from progress import (load_progress, save_progress, update_progress,
@@ -35,6 +35,19 @@ SUMMARY_INTERVAL = 50  # generate rolling summary every N actions
 FRAME_DIFF_THRESHOLD = 0.99  # skip API call if frames are this similar
 MAX_FRAME_SKIPS = 1  # force API call after this many consecutive skips
 WS_PORT = 8765
+BATTLE_SUBMENU_STATES = {"bag", "pokemon", "summary"}
+HEALING_ITEM_NAMES = {
+    "Potion",
+    "Super Potion",
+    "Hyper Potion",
+    "Max Potion",
+    "Full Restore",
+    "Fresh Water",
+    "Soda Pop",
+    "Lemonade",
+    "Moomoo Milk",
+    "Berry Juice",
+}
 
 # Websocket state
 _ws_clients: set = set()
@@ -249,6 +262,24 @@ class NamingContext:
     last_party_count: int = 0
 
 
+@dataclass
+class BattleItemContext:
+    """Tracks an in-progress battle item usage flow across submenus."""
+
+    active: bool = False
+    selected_item: str = ""
+    awaiting_target: bool = False
+
+
+@dataclass
+class BattleBagContext:
+    """Tracks synthetic battle-bag navigation when cursor memory is unreliable."""
+
+    active: bool = False
+    current_pocket: int = 0
+    current_idx: int = 0
+
+
 def _is_probable_naming_screen(game_state: dict, naming: NamingContext) -> bool:
     """Return True when the explicit naming-screen state is active."""
     return game_state.get("game_state") == "naming"
@@ -304,6 +335,33 @@ def _get_naming_action(game_state: dict, naming: NamingContext) -> dict | None:
     }
 
 
+def _recent_actions_suggest_battle_context(recent_actions: list[dict]) -> bool:
+    """Heuristic recovery when we land in a battle submenu mid-run."""
+    for action in recent_actions[-3:]:
+        reason = str(action.get("reason", "")).lower()
+        if any(token in reason for token in ("battle", "brock", "geodude", "trainer battle", "battle bag")):
+            return True
+    return False
+
+
+def _count_navigation_candidates(exploration_summary: str) -> int:
+    """Count targetable exits/NPCs listed in the exploration summary."""
+    count = 0
+    for raw_line in exploration_summary.splitlines():
+        line = raw_line.strip()
+        if (
+            line.startswith("door at (")
+            or line.startswith("stairs at (")
+            or line.startswith("north edge")
+            or line.startswith("south edge")
+            or line.startswith("east edge")
+            or line.startswith("west edge")
+            or line.startswith("(")
+        ):
+            count += 1
+    return count
+
+
 def _battle_action_button_toward(cursor: int, target: int) -> str:
     """Return the next directional/A press for the 2x2 battle action menu."""
     if cursor == target:
@@ -327,6 +385,98 @@ def _battle_action_button_toward(cursor: int, target: int) -> str:
     return "A"
 
 
+def _battle_action_would_touch_bag(cursor: int, button: str) -> bool:
+    """Return True when a battle-menu button would move to or open Bag."""
+    if button == "A":
+        return cursor == 1
+    if cursor == 0 and button == "Right":
+        return True
+    if cursor == 3 and button == "Up":
+        return True
+    if cursor == 1 and button in {"Up", "Right"}:
+        return True
+    return False
+
+
+def _find_first_healing_item(bag_items: dict | None) -> tuple[int, dict] | None:
+    """Return the first healing item in the Items pocket, if known."""
+    if not bag_items:
+        return None
+    items = bag_items.get("pockets", {}).get("Items", [])
+    for idx, item in enumerate(items):
+        if item.get("name") in HEALING_ITEM_NAMES and item.get("quantity", 0) > 0:
+            return idx, item
+    return None
+
+
+def _get_battle_bag_action(game_state: dict, bag_nav: BattleBagContext) -> dict | None:
+    """Drive the bag deterministically when it was opened from battle."""
+    bag = game_state.get("bag_items")
+    if not bag:
+        bag_nav.active = False
+        return {
+            "action": "B",
+            "reason": "Battle bag opened without parsed inventory; return to the battle menu",
+            "display": "Backing out of battle bag.",
+        }
+
+    current_pocket = bag.get("current_pocket", 0)
+    items = bag.get("pockets", {}).get("Items", [])
+    parsed_idx = bag.get("scroll", 0) + bag.get("cursor", 0)
+    if not bag_nav.active:
+        bag_nav.active = True
+        bag_nav.current_pocket = current_pocket
+        bag_nav.current_idx = max(0, min(parsed_idx, max(len(items) - 1, 0)))
+    elif current_pocket != bag_nav.current_pocket:
+        bag_nav.current_pocket = current_pocket
+        bag_nav.current_idx = max(0, min(parsed_idx, max(len(items) - 1, 0)))
+
+    if current_pocket != 0:
+        button = "Left" if current_pocket > 0 else "Right"
+        return {
+            "action": button,
+            "reason": "Battle bag: move back to the Items pocket to look for healing",
+            "display": "Switching to the Items pocket.",
+        }
+
+    healing_entry = _find_first_healing_item(bag)
+    if healing_entry is None:
+        return {
+            "action": "B",
+            "reason": "No healing items are available in the battle bag; return to the battle menu",
+            "display": "No healing items found.",
+        }
+
+    target_idx, item = healing_entry
+    if items:
+        bag_nav.current_idx = max(0, min(bag_nav.current_idx, len(items) - 1))
+    else:
+        bag_nav.current_idx = 0
+    cursor_idx = bag_nav.current_idx
+    print(
+        f"  [battle_bag] pocket={bag.get('pocket_name')} cursor={bag.get('cursor', 0)} "
+        f"scroll={bag.get('scroll', 0)} parsed_idx={parsed_idx} synthetic_idx={cursor_idx} "
+        f"target_idx={target_idx} target_item={item['name']}"
+    )
+    if cursor_idx < target_idx:
+        return {
+            "action": "Down",
+            "reason": f"Battle bag: move down to {item['name']}",
+            "display": f"Moving to {item['name']}.",
+        }
+    if cursor_idx > target_idx:
+        return {
+            "action": "Up",
+            "reason": f"Battle bag: move up to {item['name']}",
+            "display": f"Moving to {item['name']}.",
+        }
+    return {
+        "action": "A",
+        "reason": f"Battle bag: use {item['name']} on the active Pokemon",
+        "display": f"Using {item['name']}.",
+    }
+
+
 def _get_battle_menu_action(game_state: dict, llm_action: dict | None = None) -> dict | None:
     """Deterministically drive the 2x2 battle action menu when intent is obvious."""
     if not game_state.get("in_battle", False):
@@ -340,7 +490,6 @@ def _get_battle_menu_action(game_state: dict, llm_action: dict | None = None) ->
             str(llm_action.get(key, "")) for key in ("action", "reason", "display")
         ).lower()
 
-    # Never auto-flee trainer battles
     if game_state.get("is_trainer_battle", False):
         return None
 
@@ -348,6 +497,7 @@ def _get_battle_menu_action(game_state: dict, llm_action: dict | None = None) ->
     max_hp = max(game_state.get("party", [{}])[0].get("max_hp", 0), 1) if game_state.get("party") else 1
     low_hp = hp > 0 and hp / max_hp <= 0.3
     wants_run = any(token in reason_text for token in ("run", "flee", "escape"))
+
     if not wants_run and not low_hp:
         return None
 
@@ -381,6 +531,8 @@ def main():
     knowledge = WorldKnowledge()
     path_state = PathState()
     naming = NamingContext()
+    battle_item = BattleItemContext()
+    battle_bag = BattleBagContext()
     progress = load_progress()
     recent_actions: list[dict] = []
     action_count = progress.get("total_actions", 0)
@@ -388,6 +540,15 @@ def main():
     last_hourly_report = time.time()
     last_map_id = None
     last_game_state_str = None
+    last_battle_context_active = False
+    last_known_bag_items = None
+    last_battle_info = {
+        "is_trainer_battle": False,
+        "enemy_species": 0,
+        "enemy_level": 0,
+        "enemy_hp": 0,
+    }
+    last_warp_events: list[dict] = []
     last_pos: tuple[int, int] | None = None  # for door-learning on map transitions
     prev_pos: tuple[int, int] | None = None   # position from 2 frames ago
     last_tile_type: str | None = None         # "D"/"S"/None at last position
@@ -435,12 +596,57 @@ def main():
             _maybe_begin_naming(game_state, naming)
             naming_ui_active = _is_nickname_prompt(game_state, naming) or _is_probable_naming_screen(game_state, naming)
 
+            raw_game_state_str = game_state.get("game_state", "unknown")
+            if game_state.get("bag_items"):
+                last_known_bag_items = game_state["bag_items"]
+
+            if game_state.get("in_battle", False):
+                battle_context_active = True
+                last_battle_info["is_trainer_battle"] = game_state.get("is_trainer_battle", False)
+                last_battle_info["enemy_species"] = game_state.get("enemy_species", 0)
+                last_battle_info["enemy_level"] = game_state.get("enemy_level", 0)
+                last_battle_info["enemy_hp"] = game_state.get("enemy_hp", 0)
+            elif raw_game_state_str in BATTLE_SUBMENU_STATES:
+                battle_context_active = (
+                    last_battle_context_active
+                    or battle_item.active
+                    or _recent_actions_suggest_battle_context(recent_actions)
+                )
+            elif raw_game_state_str in ("overworld", "transition", "nickname_prompt", "naming"):
+                battle_context_active = False
+            else:
+                battle_context_active = False
+
+            if not battle_context_active:
+                battle_item.active = False
+                battle_item.selected_item = ""
+                battle_item.awaiting_target = False
+                battle_bag.active = False
+                battle_bag.current_idx = 0
+                battle_bag.current_pocket = 0
+
+            loop_state = dict(game_state)
+            loop_state["in_battle"] = battle_context_active
+            loop_state["bag_items"] = game_state.get("bag_items") or last_known_bag_items
+            if battle_context_active:
+                loop_state["is_trainer_battle"] = last_battle_info["is_trainer_battle"]
+                if not game_state.get("in_battle", False):
+                    loop_state["enemy_species"] = last_battle_info["enemy_species"]
+                    loop_state["enemy_level"] = last_battle_info["enemy_level"]
+                    loop_state["enemy_hp"] = last_battle_info["enemy_hp"]
+            if raw_game_state_str == "bag":
+                loop_state["bag_context"] = "battle" if battle_context_active else "overworld"
+            else:
+                loop_state["bag_context"] = ""
+
             print(
                 "  [state] "
                 f"pos=({game_state.get('player_x')},{game_state.get('player_y')}) "
                 f"map={game_state.get('map_name')} "
                 f"hp={game_state.get('player_hp')} "
                 f"battle={game_state.get('in_battle')} "
+                f"battle_ctx={battle_context_active} "
+                f"state={raw_game_state_str} "
                 f"parcel={game_state.get('has_oaks_parcel', False)} "
                 f"pokedex={game_state.get('has_pokedex', False)} "
                 f"cb2=0x{game_state.get('cb2_raw', 0):08X}"
@@ -458,18 +664,38 @@ def main():
             map_changed = (map_id != last_map_id) and last_map_id is not None
             map_name = game_state.get("map_name", "UNKNOWN")
 
-            _outdoor_tags = ("TOWN", "CITY", "ROUTE", "LAKE", "ISLAND")
-            is_outdoor_map = any(tag in map_name.upper() for tag in _outdoor_tags)
+            is_outdoor_map = is_outdoor_map_name(map_name)
 
             if map_changed:
-                # If we walked through a door/stairs, label it with destination
-                # Check both last and prev tile type to handle walk-through extra step
-                if last_tile_type in ("D", "S") and last_pos is not None:
-                    knowledge.learn_door(last_map_id, last_pos[0], last_pos[1], map_name)
-                    print(f"  [knowledge] Door at map {last_map_id} ({last_pos[0]},{last_pos[1]}) -> {map_name}")
-                elif prev_tile_type in ("D", "S") and prev_pos is not None:
-                    knowledge.learn_door(last_map_id, prev_pos[0], prev_pos[1], map_name)
-                    print(f"  [knowledge] Door at map {last_map_id} ({prev_pos[0]},{prev_pos[1]}) -> {map_name}")
+                # On any normal map change, label the destination using the last
+                # known coordinates on the previous map.
+                if not last_battle_context_active:
+                    transition_source = None
+                    transition_source_label = "previous position"
+                    if path_state.active and path_state.target_type in ("door", "stairs") and path_state.target_pos is not None:
+                        transition_source = path_state.target_pos
+                        transition_source_label = f"targeted {path_state.target_type}"
+                    elif last_pos is not None:
+                        transition_source = last_pos
+                    else:
+                        transition_source = prev_pos
+                    if transition_source is not None:
+                        tx, ty = transition_source
+                        matched_warp = next(
+                            (warp for warp in last_warp_events if warp.get("x") == tx and warp.get("y") == ty),
+                            None,
+                        )
+                        knowledge.learn_door(
+                            last_map_id,
+                            tx,
+                            ty,
+                            map_name,
+                            destination_map_id=map_id,
+                            destination_warp_id=matched_warp.get("destination_warp_id") if matched_warp else None,
+                            destination_x=px,
+                            destination_y=py,
+                        )
+                        print(f"  [knowledge] Map change via {transition_source_label} at map {last_map_id} ({tx},{ty}) -> {map_name}")
                 # Learn map edge connections (outdoor maps only)
                 if is_outdoor_map:
                     map_connections = get_map_connections(map_id)
@@ -484,45 +710,72 @@ def main():
             # Track current tile type for door learning
             current_tile_type = None
             collision = None
-            if not game_state.get("in_battle", False):
+            current_warp_events: list[dict] = []
+            if not battle_context_active:
                 collision = get_collision_grid(map_id)
                 if collision:
                     grid_w, grid_h, grid_rows = collision
                     if 0 <= px < grid_w and 0 <= py < grid_h:
                         current_tile_type = grid_rows[py][px]
+                current_warp_events = get_warp_events(map_id)
+                for warp_event in current_warp_events:
+                    knowledge.set_door_destination_hint(
+                        map_id,
+                        warp_event["x"],
+                        warp_event["y"],
+                        warp_event["destination_map"],
+                        destination_map_id=warp_event.get("destination_map_id"),
+                        destination_warp_id=warp_event.get("destination_warp_id"),
+                    )
 
             prev_pos = last_pos
             last_pos = (px, py)
             prev_tile_type = last_tile_type
             last_tile_type = current_tile_type
             last_map_id = map_id
+            last_warp_events = current_warp_events
 
             # 3. Update progress
-            progress = update_progress(progress, game_state, action_count)
+            progress = update_progress(progress, loop_state, action_count)
             progress_summary = get_summary_line(progress)
 
             # 3a. Tiered objective updates
-            current_game_state_str = game_state.get("game_state", "unknown")
+            current_game_state_str = raw_game_state_str
             state_changed = (current_game_state_str != last_game_state_str) and last_game_state_str is not None
 
-            entered_battle = current_game_state_str == "battle" and last_game_state_str != "battle"
-            exited_battle = current_game_state_str == "overworld" and last_game_state_str not in ("overworld", None)
+            entered_battle = battle_context_active and not last_battle_context_active
+            exited_battle = (not battle_context_active) and last_battle_context_active
 
             if state_changed:
                 print(f"  [state change] {last_game_state_str} -> {current_game_state_str}")
+            if current_game_state_str == "bag" and state_changed:
+                battle_bag.active = False
+                last_action = recent_actions[-1] if recent_actions else None
+                if last_action:
+                    print(
+                        f"  [bag] Entered {loop_state['bag_context']} bag after "
+                        f"{last_action['action']} ({last_action['reason']})"
+                    )
+                else:
+                    print(f"  [bag] Entered {loop_state['bag_context']} bag")
             last_game_state_str = current_game_state_str
+            last_battle_context_active = battle_context_active
 
-            check_tier1_update(progress, game_state)
+            check_tier1_update(progress, loop_state)
 
-            in_battle_now = current_game_state_str == "battle"
-            planner_state = dict(game_state)
+            in_battle_now = battle_context_active
+            planner_state = dict(loop_state)
             planner_state["_progress_context"] = progress
             if entered_battle or exited_battle:
                 progress["tier2_last_action"] = action_count - 50
+            print(
+                f"  [loop] Tier2 check: action={action_count} entered_battle={entered_battle} "
+                f"exited_battle={exited_battle} in_battle={in_battle_now}"
+            )
             check_tier2_update(progress, planner_state, action_count, in_battle=in_battle_now)
 
             # Detect Pokecenter heal: lead HP went to full while in a Pokecenter
-            party = game_state.get("party", [])
+            party = loop_state.get("party", [])
             lead_hp = party[0].get("hp", 0) if party else 0
             lead_max_hp = party[0].get("max_hp", 1) if party else 1
             just_healed = (
@@ -544,6 +797,7 @@ def main():
                 print(f"  [tier3] Triggered by: {trigger} (state={current_game_state_str})")
                 try:
                     tier2 = progress.get("tier2_objective", "")
+                    print("  [loop] Tier3 objective refresh starting")
                     new_objective = rethink_objective(planner_state, tier2, in_battle=in_battle_now)
                     progress["current_objective"] = new_objective
                     print(f"  [tier3] {new_objective}")
@@ -586,13 +840,21 @@ def main():
             # 5. Choose next action
             NO_COST = {"model": "nav-state", "input_tokens": 0, "output_tokens": 0, "cache_read": 0, "cache_creation": 0}
 
-            battle_menu_action = _get_battle_menu_action(game_state)
+            battle_menu_action = _get_battle_menu_action(loop_state)
             if battle_menu_action:
+                print("  [loop] Using structured battle menu action")
                 action = battle_menu_action
+                usage = NO_COST
+            elif current_game_state_str == "bag" and battle_context_active:
+                action = {
+                    "action": "B",
+                    "reason": "Battle bag disabled for now; return to the battle menu",
+                    "display": "Backing out of battle bag.",
+                }
                 usage = NO_COST
             elif (
                 game_state.get("game_state") == "unknown"
-                and not game_state.get("in_battle", False)
+                and not battle_context_active
                 and not game_state.get("in_dialogue", False)
                 and "POKECENTER" in game_state.get("map_name", "")
             ):
@@ -601,7 +863,7 @@ def main():
             elif naming_action:
                 action = naming_action
                 usage = NO_COST
-            elif game_state.get("in_dialogue", False) and not game_state.get("in_battle", False):
+            elif game_state.get("in_dialogue", False) and not battle_context_active:
                 action = {"action": "A", "reason": "Advance dialogue", "display": "Advancing dialogue."}
                 usage = NO_COST
                 # Learn NPC info from dialogue
@@ -627,7 +889,8 @@ def main():
                 # If no active path, ask LLM for a target (try up to 3 times with different targets)
                 if not path_state.active and exploration_summary:
                     failed_targets = []
-                    for _attempt in range(3):
+                    max_attempts = max(1, _count_navigation_candidates(exploration_summary))
+                    for _attempt in range(max_attempts):
                         nav_result = get_navigation_target(
                             exploration_summary, progress_summary,
                             failed_targets=failed_targets if failed_targets else None,
@@ -675,16 +938,61 @@ def main():
                     usage = NO_COST
             else:
                 # Non-overworld (battle, bag, etc.) — call LLM
-                action, usage = get_action(game_state, recent_actions, progress_summary)
+                print("  [loop] Falling back to Claude for direct action")
+                action, usage = get_action(loop_state, recent_actions, progress_summary)
+                if (
+                    battle_context_active
+                    and current_game_state_str == "battle"
+                    and game_state.get("battle_menu_state", 0) == 1
+                ):
+                    battle_cursor = game_state.get("battle_action_cursor", 0)
+                    proposed_button = action.get("action", "A")
+                    if _battle_action_would_touch_bag(battle_cursor, proposed_button):
+                        reroute_button = _battle_action_button_toward(battle_cursor, 0)
+                        action = {
+                            "action": reroute_button,
+                            "reason": "Battle bag disabled for now; steer back toward Fight instead",
+                            "display": "Avoiding Bag.",
+                        }
+                        usage = NO_COST
 
             # 6. Press the button
             button = action.get("action", "A")
             reason = action.get("reason", "no reason given")
+            if (
+                battle_context_active
+                and current_game_state_str == "battle"
+                and game_state.get("battle_menu_state", 0) == 1
+            ):
+                battle_cursor = game_state.get("battle_action_cursor", 0)
+                if _battle_action_would_touch_bag(battle_cursor, button):
+                    button = _battle_action_button_toward(battle_cursor, 0)
+                    action = {
+                        "action": button,
+                        "reason": "Battle bag disabled for now; steer back toward Fight instead",
+                        "display": "Avoiding Bag.",
+                    }
+                    reason = action["reason"]
+            print(f"  [action] {button} - {reason}")
             try:
                 press_frames = 16
-                if naming_action or (game_state.get("in_dialogue", False) and not game_state.get("in_battle", False)):
+                if naming_action or (game_state.get("in_dialogue", False) and not battle_context_active):
                     press_frames = 2
+                print(f"  [input] Sending {button} for {press_frames} frames")
                 press_button(button, frames=press_frames)
+                print("  [input] Button press acknowledged")
+                if current_game_state_str == "bag" and battle_context_active:
+                    if button == "Up":
+                        battle_bag.current_idx = max(0, battle_bag.current_idx - 1)
+                    elif button == "Down":
+                        items = loop_state.get("bag_items", {}).get("pockets", {}).get("Items", [])
+                        if items:
+                            battle_bag.current_idx = min(len(items) - 1, battle_bag.current_idx + 1)
+                    elif button in ("Left", "Right"):
+                        battle_bag.active = False
+                if current_game_state_str == "pokemon" and battle_context_active and battle_item.awaiting_target and button == "A":
+                    print(f"  [battle_item] Target selected for {battle_item.selected_item or 'item'}")
+                    battle_item.awaiting_target = False
             except (TimeoutError, ConnectionError, OSError) as e:
                 print(f"  [err] Failed to press button: {e}")
                 time.sleep(5)
@@ -715,7 +1023,7 @@ def main():
 
             # 7. Calculate cost and log
             cost = calculate_cost(usage)
-            log_action(conn, action, usage, cost, game_state,
+            log_action(conn, action, usage, cost, loop_state,
                        progress_summary=progress_summary,
                        exploration_summary=exploration_summary or "")
             action_count += 1
@@ -738,7 +1046,7 @@ def main():
                 "action": button,
                 "reason": action.get("display", reason),
                 "model": usage["model"],
-                "in_battle": game_state.get("in_battle", False),
+                "in_battle": loop_state.get("in_battle", False),
                 "action_count": action_count,
                 "total_cost": stats["total_cost"],
                 "badges": progress.get("badges", 0),
@@ -748,15 +1056,15 @@ def main():
                 "tier2_objective": progress.get("tier2_objective", ""),
                 "nav_target": path_state.target_id or "",
                 "nav_path_len": len(path_state.path),
-                "player_x": game_state.get("player_x", 0),
-                "player_y": game_state.get("player_y", 0),
-                "map_name": game_state.get("map_name", ""),
-                "player_hp": game_state.get("player_hp", 0),
-                "player_level": game_state.get("player_level", 0),
-                "party_count": game_state.get("party_count", 0),
-                "party": game_state.get("party", []),
-                "has_oaks_parcel": game_state.get("has_oaks_parcel", False),
-                "has_pokedex": game_state.get("has_pokedex", False),
+                "player_x": loop_state.get("player_x", 0),
+                "player_y": loop_state.get("player_y", 0),
+                "map_name": loop_state.get("map_name", ""),
+                "player_hp": loop_state.get("player_hp", 0),
+                "player_level": loop_state.get("player_level", 0),
+                "party_count": loop_state.get("party_count", 0),
+                "party": loop_state.get("party", []),
+                "has_oaks_parcel": loop_state.get("has_oaks_parcel", False),
+                "has_pokedex": loop_state.get("has_pokedex", False),
                 "hourly_summaries": hourly_summaries,
             })
 

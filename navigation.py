@@ -76,6 +76,26 @@ def _collision_with_npcs(
     return (grid_w, grid_h, new_rows)
 
 
+def _collision_avoiding_warps(
+    collision: tuple[int, int, list[str]],
+    player_x: int,
+    player_y: int,
+    allow_pos: tuple[int, int] | None = None,
+) -> tuple[int, int, list[str]]:
+    """Block non-target doors/stairs so routes don't accidentally warp."""
+    grid_w, grid_h, grid_rows = collision
+    new_rows = [list(row) for row in grid_rows]
+    for y in range(grid_h):
+        for x in range(grid_w):
+            if (x, y) == (player_x, player_y):
+                continue
+            if allow_pos is not None and (x, y) == allow_pos:
+                continue
+            if new_rows[y][x] in ("D", "S"):
+                new_rows[y][x] = "1"
+    return (grid_w, grid_h, new_rows)
+
+
 def plan_path_to_target(
     target_str: str,
     collision: tuple[int, int, list[str]],
@@ -89,24 +109,23 @@ def plan_path_to_target(
     """
     target_type, target_value = parse_target(target_str)
 
-    if target_type == "door":
+    if target_type in ("door", "stairs"):
         try:
             x_str, y_str = target_value.split(",")
             tx, ty = int(x_str), int(y_str)
         except (ValueError, IndexError):
             return None
         nav_grid = _collision_with_npcs(collision, objects, player_x, player_y)
+        nav_grid = _collision_avoiding_warps(nav_grid, player_x, player_y, allow_pos=(tx, ty))
         path = path_to_target_tile(nav_grid, player_x, player_y, tx, ty)
         if path is None:
             return None
-        # Append one extra step to walk THROUGH the door (not just onto it).
-        # Some doors (gates, exits) only warp when you keep walking.
-        # For doors that warp on contact, the map change clears the path
-        # before the extra step executes, so this is harmless.
-        if path:
+        # Doors often need one extra step to walk through the warp.
+        # Stairs warp immediately on contact, so stop on the tile.
+        if target_type == "door" and path:
             path.append(path[-1])
         state = PathState(
-            target_type="door",
+            target_type=target_type,
             target_id=target_str,
             target_pos=(tx, ty),
             path=path,
@@ -131,6 +150,7 @@ def plan_path_to_target(
         # Path to adjacent tile (handles counter-talk too)
         nav_grid = _collision_with_npcs(collision, objects, player_x, player_y,
                                          exclude_npc_id=local_id)
+        nav_grid = _collision_avoiding_warps(nav_grid, player_x, player_y)
         path, _, pos = path_to_adjacent_object(
             nav_grid, player_x, player_y, objects,
             match_fn=lambda o: o.get("local_id") == local_id,
@@ -166,9 +186,51 @@ def plan_path_to_target(
 
         from exploration import path_to_nearest_tile
         nav_grid = _collision_with_npcs(collision, objects, player_x, player_y)
+        nav_grid = _collision_avoiding_warps(nav_grid, player_x, player_y)
         path, pos = path_to_nearest_tile(
-            nav_grid, player_x, player_y, edge_predicate, max_steps=200
+            nav_grid, player_x, player_y, edge_predicate, max_steps=300
         )
+        if path is None:
+            def exit_predicate(x, y, tile, *_):
+                if tile not in ("D", "S"):
+                    return False
+                if direction == "north":
+                    return y < player_y
+                if direction == "south":
+                    return y > player_y
+                if direction == "west":
+                    return x < player_x
+                if direction == "east":
+                    return x > player_x
+                return True
+
+            path, pos = path_to_nearest_tile(
+                nav_grid, player_x, player_y, exit_predicate, max_steps=300
+            )
+            if path is not None and pos is not None:
+                state = PathState(
+                    target_type="stairs" if collision[2][pos[1]][pos[0]] == "S" else "door",
+                    target_id=f"{'stairs' if collision[2][pos[1]][pos[0]] == 'S' else 'door'}:{pos[0]},{pos[1]}",
+                    target_pos=pos,
+                    path=path,
+                )
+                return state
+
+            path, pos = path_to_nearest_tile(
+                nav_grid,
+                player_x,
+                player_y,
+                lambda x, y, tile, *_: tile in ("D", "S"),
+                max_steps=300,
+            )
+            if path is not None and pos is not None:
+                state = PathState(
+                    target_type="stairs" if collision[2][pos[1]][pos[0]] == "S" else "door",
+                    target_id=f"{'stairs' if collision[2][pos[1]][pos[0]] == 'S' else 'door'}:{pos[0]},{pos[1]}",
+                    target_pos=pos,
+                    path=path,
+                )
+                return state
         if path is None:
             return None
         state = PathState(
@@ -205,6 +267,11 @@ def get_arrival_action(path_state: PathState,
         for d in ["Down", "Up", "Left", "Right"]:
             return d
 
+
+    elif path_state.target_type == "stairs":
+        direction = facing_direction((player_x, player_y), (tx, ty))
+        if direction:
+            return direction
     elif path_state.target_type == "npc":
         # Face the NPC and press A
         return "A"

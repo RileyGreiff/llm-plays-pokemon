@@ -2,17 +2,44 @@
 
 import json
 import os
+import re
 from collections import deque
 
 SAVE_PATH = "logs/exploration.json"
 
 PASSABLE_TILES = {"0", "D", "S", "G"}
 CARDINAL_STEPS = [("Up", 0, -1), ("Down", 0, 1), ("Left", -1, 0), ("Right", 1, 0)]
+OUTDOOR_MAP_TAGS = ("TOWN", "CITY", "ROUTE", "LAKE", "ISLAND")
+INDOOR_MAP_TAGS = (
+    "POKECENTER",
+    "MART",
+    "GYM",
+    "HOUSE",
+    "MUSEUM",
+    "LAB",
+    "GATE",
+    "ROOM",
+    "DOJO",
+    "MANSION",
+    "HIDEOUT",
+    "CAVE",
+    "TUNNEL",
+)
 
 
 def is_passable(tile: str) -> bool:
     """Return True if the tile can be walked on."""
     return tile in PASSABLE_TILES
+
+
+def is_outdoor_map_name(map_name: str) -> bool:
+    """Return True for outdoor maps and False for indoor/interior maps."""
+    upper = (map_name or "").upper()
+    if any(tag in upper for tag in INDOOR_MAP_TAGS):
+        return False
+    if re.search(r"_(?:B?\d+F)$", upper):
+        return False
+    return any(tag in upper for tag in OUTDOOR_MAP_TAGS)
 
 
 def _neighbors() -> list[tuple[str, int, int]]:
@@ -22,7 +49,7 @@ def _neighbors() -> list[tuple[str, int, int]]:
 def path_to_nearest_tile(collision_grid: tuple[int, int, list[str]],
                          player_x: int, player_y: int,
                          predicate,
-                         max_steps: int = 40) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
+                         max_steps: int = 300) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
     """BFS to the nearest tile matching `predicate`.
 
     The predicate receives `(x, y, tile, grid_w, grid_h, grid_rows)`.
@@ -92,7 +119,7 @@ def path_to_target_tile(collision_grid: tuple[int, int, list[str]],
 
 def path_to_nearest_door(collision_grid: tuple[int, int, list[str]],
                          player_x: int, player_y: int,
-                         max_steps: int = 40) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
+                         max_steps: int = 300) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
     """Find the nearest reachable door/entrance tile."""
     return path_to_nearest_tile(
         collision_grid,
@@ -105,7 +132,7 @@ def path_to_nearest_door(collision_grid: tuple[int, int, list[str]],
 
 def path_to_nearest_grass(collision_grid: tuple[int, int, list[str]],
                           player_x: int, player_y: int,
-                          max_steps: int = 40) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
+                          max_steps: int = 300) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
     """Find the nearest reachable tall grass tile."""
     return path_to_nearest_tile(
         collision_grid,
@@ -118,7 +145,7 @@ def path_to_nearest_grass(collision_grid: tuple[int, int, list[str]],
 
 def path_to_map_edge(collision_grid: tuple[int, int, list[str]],
                      player_x: int, player_y: int,
-                     max_steps: int = 40) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
+                     max_steps: int = 300) -> tuple[list[str], tuple[int, int]] | tuple[None, None]:
     """Find the nearest reachable walkable tile on the edge of the current map."""
     return path_to_nearest_tile(
         collision_grid,
@@ -436,8 +463,7 @@ class ExplorationTracker:
         if player_x is None or player_y is None:
             return ""
 
-        is_outdoor = any(tag in map_name.upper() for tag in
-                         ["TOWN", "CITY", "ROUTE", "LAKE", "ISLAND"])
+        is_outdoor = is_outdoor_map_name(map_name)
 
         lines = [f"MAP: {map_name} ({'outdoor' if is_outdoor else 'indoor'})"]
 
@@ -495,8 +521,9 @@ class ExplorationTracker:
                 if dx_diff > 0: dir_parts.append("east")
                 dir_str = "-".join(dir_parts) if dir_parts else "here"
 
-                # Hide entrance door only on outdoor/large maps with other exits
-                if is_entrance and is_outdoor and len(doorways) > 1:
+                # Hide the entrance we just used whenever other exits exist.
+                # This prevents immediate backtracking after a map change.
+                if is_entrance and len(doorways) > 1:
                     continue
                 exit_lines.append((dist, f"  {tile_type} at ({rep_x},{rep_y}) -> {label} ({dist} tiles {dir_str})"))
 
